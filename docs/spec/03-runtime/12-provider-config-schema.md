@@ -85,13 +85,13 @@ Tables (canonical DDL in [04-data-storage](04-data-storage.md) §4.3–4.4, §4.
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "contextWindow", "maxTokens", "thinkingLevels", "defaultThinkingLevel"],
+        "required": ["id"],
         "properties": {
           "id": { "type": "string", "minLength": 1 },
           "alias": { "type": "string", "maxLength": 60 },
-          "contextWindow": { "type": "integer", "minimum": 1 },
+          "contextWindow": { "type": "integer", "minimum": 0 },
           "contextWindowSource": { "enum": ["catalog", "user"] },
-          "maxTokens": { "type": "integer", "minimum": 1 },
+          "maxTokens": { "type": "integer", "minimum": 0 },
           "thinkingLevels": {
             "type": "array",
             "items": { "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
@@ -191,6 +191,25 @@ materializes one binding on read with a 128,000 context window, 8,192 max
 output, no enabled thinking levels, and a null default. The settings editor
 still renders all canonical choices for that legacy binding, and the next write
 stores the explicit binding array in `config_json.models`.
+
+`models[].contextWindow` and `models[].maxTokens` are optional on the wire. An
+absent key, or an explicit `0`, is not a per-model choice: the host reads it as
+zero and seeds the generic default (128,000 / 8,192) — the same value the
+legacy binding above is materialized with, and the same value a plugin
+manifest that declares no limits already produces. The stored array and the
+manifest therefore agree on what a model without limits means (D610).
+
+Each entry of a stored `models` array is decoded on its own. An entry that no
+longer matches the schema is skipped and reported on the host log with the
+provider id, its index and the reason, instead of discarding the whole array.
+The read remains usable, but it is marked degraded: invalid JSON, a non-object
+config, a non-array `models` value, or any unreadable entry is reported. An
+absent `models` key and an empty array remain legal legacy states; an array
+whose entries are all unreadable still falls back to the legacy binding and is
+reported. To prevent a partial settings view from erasing stored data,
+`providers.update` rejects an explicit model-array replacement with
+`MODEL_BINDINGS_DEGRADED` while the stored value is degraded. Updates to
+unrelated provider fields remain allowed.
 
 For context resolution, that 128,000 value is a backward-compatible generic
 seed, not a reason to hide a published long-context limit. If models.dev now

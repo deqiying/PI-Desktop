@@ -212,6 +212,7 @@ reveal 不并入任何行，必须重新读取。
 |---|---|---|
 | `PROVIDER_SECRET_MISSING` | 不 | 启用的提供程序需要 API 密钥 |
 | `MODEL_ALIAS_TOO_LONG` | 不 | 已配置模型别名超过 60 个 Unicode 字符 |
+| `MODEL_BINDINGS_DEGRADED` | 不 | 存储模型绑定已降级；为防止数据丢失，拒绝显式替换模型数组 |
 | `SECRET_STORE_UNAVAILABLE` | 也许 | 操作系统安全存储不可用（保留） |
 | `SETTINGS_INVALID` | 不 | 设置有效负载无效（保留） |
 

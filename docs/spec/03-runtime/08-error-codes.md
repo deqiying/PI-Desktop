@@ -216,6 +216,7 @@ malformed.
 |---|---|---|
 | `PROVIDER_SECRET_MISSING` | no | enabled provider requires an API key |
 | `MODEL_ALIAS_TOO_LONG` | no | configured model alias exceeds 60 Unicode characters |
+| `MODEL_BINDINGS_DEGRADED` | no | stored model bindings are unreadable; explicit model-array replacement is blocked to prevent data loss |
 | `SECRET_STORE_UNAVAILABLE` | maybe | OS secure storage unavailable (reserved) |
 | `SETTINGS_INVALID` | no | settings payload invalid (reserved) |
 

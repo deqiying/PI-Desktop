@@ -240,7 +240,8 @@ a usage tab.
     are rejected with an inline error; an unbound action never participates in
     conflict checks
   - each override can be restored independently and all overrides can be
-    restored together
+    restored together; an individual reset rejects a default already used by
+    another action, preserving both mappings and showing the same conflict error
   - overrides persist in optional `AppSettings.keybindings`; a missing entry
     uses the platform default, a valid string uses the custom binding, and
     `null` disables the action. macOS native-menu accelerators and

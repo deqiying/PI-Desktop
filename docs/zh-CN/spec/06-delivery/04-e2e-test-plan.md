@@ -1791,6 +1791,10 @@ hover/focus 不带移位标签，项目标题 hover/focus 路径显示
 - **步骤**：1) 打开侧边栏项目溢出菜单并选择“编辑项目”。2) 修改名称，移除
   附加文件夹，再通过原生文件夹选择器将其添加回来。3) 确认 Primary 行不能移除。
   4) 保存并检查侧边栏、项目存档中的根目录和当前工作区。5) 重启应用并再次检查项目组。
+- **后台更新回归**：从设置打开编辑项目，修改名称并移除附加文件夹，然后在保存前
+  完成一个后台任务。两项草稿修改必须保留，并一起保存。隔离渲染测试为
+  `node scripts/e2e-project-edit.mjs`；使用真实页面和 store，仅控制 host IPC 边界，
+  不代表已验证磁盘持久化。
 - **预期**：两个项目菜单都提供编辑项目；编辑器保持焦点、去除首尾空格并限制为
   80 个 Unicode 字符，Primary 文件夹始终是第一行，根目录数量更新且不会误删其他行。
   保存后仍是一个逻辑项目组，调整后的根目录会持久化；名称在重启后保留，规范化
@@ -2977,12 +2981,15 @@ PI-Desktop 图标；两个表面都不会暴露库存 Electron 名称或图标�
   确认所有行都恢复默认。9) 在 macOS 上检查每次保存/恢复后的本机菜单加速器。10)
   在 Windows 上禁用插件启动器，确认旧的全局绑定、聚焦窗口后备和 Alt+Space host
   后备都已关闭。11) 单独按下并释放 Ctrl/Command，确认 IME 候选，并长按
-  back/forward 组合以产生重复。
+  back/forward 组合以产生重复。12) 禁用 New task，把其默认组合分配给 Search，
+  再单独恢复 New task；确认出现冲突提示、两项绑定不变，且该组合仍能打开 Search。
+  将 New task 改为自定义绑定后重复测试；恢复 Search 释放组合后，再恢复 New task。
 - **预期**：操作分为导航、Agent 和窗口，并使用平台原生按键标签；录制有可见焦点
   且 `Escape` 取消；自定义 Search 组合立即生效、替换旧组合、跨重启保留并更新
   macOS 菜单；重复、无修饰符和保留组合以内联错误拒绝；“未绑定”是明确的本地化
   状态，不参与冲突、不响应旧或默认组合、可跨重启保存，并会移除 macOS 加速器和
-  Windows 启动器后备层；单项和全局恢复都返回共享默认值。仅修饰符和 IME 按键不
+  Windows 启动器后备层；单项恢复遇到默认组合已被占用时拒绝保存，保留两项绑定；
+  无冲突的单项恢复和全局恢复都返回共享默认值。仅修饰符和 IME 按键不
   会发送命令，长按历史组合每次物理按压只遍历一次。窗口可见性只有一个开关键
   `Alt + Shift + W` —— 可见且在前台的窗口隐藏到托盘，其余情况显示并获得焦点 ——
   且绝不走关闭路径，因此不会弹出关闭行为询问、也不会退出应用；该键刻意避开
@@ -5295,6 +5302,8 @@ eleven-tool-round desktop paths are verified by
 | 品质（工具调用 id 唯一） | E2E-RUNTIME-unique-tool-call-ids-per-request |
 | G — 插件宿主生命周期（崩溃上报） | E2E-PLUGIN-crash-report-names-the-exit-code |
 | 品质（崩溃上报） | E2E-PLUGIN-crash-report-names-the-exit-code |
+| F — 持久化（存储的模型绑定数组） | E2E-PROVIDER-stored-binding-array-reads-entry-by-entry |
+| 品质（存储的模型绑定数组） | E2E-PROVIDER-stored-binding-array-reads-entry-by-entry |
 
 `US-UI-*` 视觉场景（§UI shell 视觉场景）追踪到
 [决策日志 §D](/zh-CN/spec/08-meta/decisions-log) 中的法典平价决策
@@ -8491,3 +8500,23 @@ the latest destination. These assertions measure work counts, not device FPS.
 - **Status:** Automated by `node --experimental-strip-types
   scripts/e2e-scheduled-workspace.mjs`, using production Electron dispatch and
   real Rust/stdio/SQLite. Only external inference is replaced with an observer.
+
+#### E2E-PROVIDER-stored-binding-array-reads-entry-by-entry：存储的模型绑定数组逐条读取
+
+- **前置条件**：一次性数据目录与 host-core 可执行文件；通过 `providers.create`
+  建立一个至少含三条完整绑定的提供商；不使用真实提供商或凭据。
+- **步骤**：调用 `providers.list`，确认全部绑定都返回。编辑存储的
+  `config_json`，删掉其中一个绑定的 `maxTokens`，再次 list。补回该字段后再
+  list。最后把某个绑定的 `contextWindow` 改成字符串，再 list 一次；用可读子集
+  携带一个无关字段变更调用 `providers.update`。
+- **预期**：除损坏条目外，三条绑定都按存储顺序返回。丢失 `maxTokens` 的绑定以
+  通用默认输出上限读出，补回字段后数值恢复。宿主日志为无法解码的条目带上提供商
+  id、条目下标与原因。显式模型数组更新返回 `MODEL_BINDINGS_DEGRADED`，而存储的
+  `config_json` 保持不变。
+- **链接规格**：`03-runtime/12-provider-config-schema.md` §2、
+  `08-meta/decisions-log.md` D610
+- **验收**：F（持久化）、品质
+- **状态**：单元覆盖（`providers::catalog::tests`、
+  `providers::tests::a_stored_array_survives_an_entry_that_lost_a_field`）；
+  宿主 RPC 路径由 `scripts/e2e-smoke.mjs` 覆盖提供商的创建与列举，但没有套件
+  驱动手工编辑的 `config_json`。

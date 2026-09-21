@@ -526,7 +526,8 @@ visually distinct from list content.
   accent-tinted focus ring, not an outline stroke. Edit project reuses the same
   surface, loads the host-owned group, allows the name and non-primary folders
   to be adjusted, keeps Primary first and non-removable, and rejects removal of
-  a folder that still owns chats. The source selector offers This computer and
+  a folder that still owns chats. Background session or run-status updates
+  must preserve unsaved name and folder edits in the open editor. The source selector offers This computer and
   Git repository as equal filled tiles without strokes (D297); the active source
   uses a deeper tile, not a selected border. A repository URL reuses the clone
   rules of ADR 0247 and its checkout becomes the primary root of the same group.
