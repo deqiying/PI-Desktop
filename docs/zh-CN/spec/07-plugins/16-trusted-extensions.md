@@ -161,7 +161,7 @@ main、渲染层或插件宿主进程中。
 | 类别 | 成员 |
 |---|---|
 | 支持 | `registerTool`、`registerCommand`、§6 中每个事件的 `on(...)`、`exec`、`getActiveTools`、`getAllTools`、`setActiveTools`、`getCommands`、`setModel`（v1 说明：返回 `false`，桌面拥有会话的 provider 绑定）、`getThinkingLevel`、`setThinkingLevel`、`setSessionName`、`getSessionName`、`sendUserMessage`（Host 队列，D386）、`getFlag` |
-| 上下文上支持 | `ui.notify`、`ui.confirm`、`ui.select`、`ui.input`、`ui.setStatus`、`ui.setWorkingMessage`、`cwd`、`modelRegistry`、`isIdle`、`abort`、`hasPendingMessages`、`getContextUsage`、`compact`、`getSystemPrompt`、`waitForIdle`、`newSession`、`fork` |
+| 上下文上支持 | `ui.notify`、`ui.confirm`、`ui.select`、`ui.input`、`ui.setStatus`、`ui.setWorkingMessage`、`cwd`、`modelRegistry`、`providers`、`isIdle`、`abort`、`hasPendingMessages`、`getContextUsage`、`compact`、`getSystemPrompt`、`waitForIdle`、`newSession`、`fork` |
 | 推迟到 v2 | `sendMessage`、`appendEntry`、`setLabel`、`sessionManager` 只读 API、`switchSession`、`registerShortcut`、`registerMarkdownTransformer`、`ui.setEditorText`、`ui.getEditorText`、`ui.addAutocompleteProvider`、`registerFlag` 值编辑 |
 | 不支持 | `ui.setWidget`、`ui.setFooter`、`ui.setHeader`、`ui.setTitle`、`ui.custom`、`ui.overlay`、`ui.onTerminalInput`、`ui.setWorkingVisible`、`ui.setWorkingIndicator`、`ui.setHiddenThinkingLabel`、`ui.pasteToEditor`、`ui.editor`、`registerMessageRenderer`、`registerEntryRenderer`、`navigateTree`、`shutdown` |
 
@@ -179,6 +179,92 @@ main、渲染层或插件宿主进程中。
 并按扩展、按成员各产生一条诊断（ADR 0300）。插件自有的 provider 保留其原有答案：
 其认证状态报告为已配置且 `source: "runtime"`，其显示名是插件 agent 的名称，
 且 `hasConfiguredAuth` 对它返回 true。main 不拥有的会话 id 会在任何目录读取之前被拒绝。
+
+### 5.1 provider 请求面
+
+`ctx.providers.request(input)` 向调用方点名的一条 provider 行发出一次带认证的 HTTP
+请求。它刻意不是补全 API：路径由调用方给出，因此同一个成员可以到达
+`/chat/completions`、`/images/generations`、`/embeddings`，或该 provider 暴露的
+任何其他路径。Host 只贡献三样东西，且不含任何协议特定内容 —— 目标 origin、凭据和
+传输策略。它按调用方的要求组装信封，却从不解释它，不知道流式，也不把 provider
+响应映射成 PI 类型（ADR 0301）。
+
+| 输入 | 契约 |
+|---|---|
+| `providerId` | 必填，永不推断。缺少它的调用是 `INVALID_ARGUMENT`；没有默认 provider，也不回退到会话模型 |
+| `modelId` | 可选；用于选择模型级的 provider 细节，且必须是该 provider 的绑定（否则为 `MODEL_NOT_CONFIGURED`）。它永不注入请求体 |
+| `path` | 追加到 provider 行的 `baseUrl` 之后。校验见下文 |
+| `method` | `GET`（默认）、`POST`、`PUT`、`PATCH`、`DELETE` |
+| `headers` | 在既有 provider 请求头上限之内合并。Host 拒绝 `authorization`、`proxy-authorization`、`cookie`、`set-cookie`、`host`、`content-length`、`content-type`、`connection`、`transfer-encoding`、`upgrade`、`te`、`trailer`、`keep-alive`、`x-api-key`、`api-key`、`chatgpt-account-id` 以及任何 `x-forwarded-*` |
+| `body` | 联合类型：`json`（由 Host 序列化）、`text`、`base64` 或 `multipart`。`content-type` 归 Host 所有，multipart 边界由 Host 生成，且永不嗅探内容；`GET` 上的请求体被拒绝 |
+| `timeoutMs` | 单次调用预算：默认 60 000，最大 300 000 |
+| `signal` | 取消该调用，包括已经在途的调用 |
+
+目的地（规范性）。最终 URL 的 scheme、host 和 port 来自 provider 行的 `baseUrl`，
+调用方的路径追加到基础路径之后：只有路径由调用方控制，没有隐式的 `/v1`，查询字符串
+属于路径的一部分。调用方字符串若为空、超过 2048 字节、是绝对 URL、是相对 scheme 的
+URL，或携带反斜杠、片段、控制字符，或含 `..` 路径段 —— 包括只在百分号解码之后才出现
+的那种（解码最多两轮）—— 都是 `INVALID_ARGUMENT`。规范化之后，最终 origin 必须等于
+基础 origin，且最终 pathname 仍必须以基础 pathname 开头；该校验在 Electron main 中
+执行，永不在 sidecar 或扩展中执行。
+
+凭据与传输。凭据经 `providers.get` 与 `providers.getSecret` 解析，其请求头由 Host
+**最后**设置，因此调用方无法覆盖或伪造它。不存在或已被禁用的行是
+`PROVIDER_NOT_FOUND`；需要密钥却没有存储的行是 `PROVIDER_AUTH_MISSING`；
+`authKind: "oauth"` 在 v1 是 `PROVIDER_AUTH_UNSUPPORTED`，因为厂商账户的线上端点是
+模型相关的，其令牌也是短时的。重定向**不**跟随：3xx 连同其 `location` 作为结果返回，
+因此凭据永不会被重发给 provider 行没有点名的 host。这条路径上没有自动重试；
+`Retry-After` 请求头会以 `retryAfterMs` 浮现，供调用方自行控制节奏。
+
+响应。HTTP 响应 —— 包括 4xx 与 5xx —— 是**结果**，不是 Host 错误：它携带 `status`、
+`statusText`、`ok`、`contentType`、请求头，以及按形态解码的响应体（媒体类型为 JSON
+且解析成功时为 `json`，文本类型为 `text`，否则为 `base64`）及其字节长度。返回的请求头
+中会剥掉 `set-cookie` 与凭据请求头。超过 4 MiB 的响应体是 `RESPONSE_TOO_LARGE`，
+而不是被截断。
+
+授权。`ctx.providers.request` 需要 `provider.request` 授权（高风险，安装时确认）。
+它带着用户的凭据触达整个 provider API 面 —— 任意路径、任意方法 —— 包括花钱的端点，
+因此没有任何现有权限覆盖它，且每次调用都记审计。主体从 main 拥有的状态解析：main 在
+启动时填充的会话→项目映射，加上已加载插件注册表。线上载荷携带会话 id、*声称的*
+`extensionId` 和一个 `callId`；不在该会话已加载扩展集合内的 id 会被拒绝，声称的 id
+只用于审计归属。没有授权时该调用是 `PERMISSION_DENIED` 并记一条审计。向同一个会话
+贡献扩展的两个插件在运行时无法区分（它们的模块共享一个进程），因此门控是两者授权的
+并集 —— 这是已记录的残余限制，不是隔离。
+
+刹车。请求与插件宿主共享 `agent.complete` 计数器（每个插件每滚动 60 秒 8 次），
+每个插件最多 4 个在途，且各自有独立预算。审计行记录方法、状态、耗时、文件数和字节
+大小 —— 永不含路径、请求头值、字段值或凭据。
+
+上传。`multipart.files` 条目只从会话拥有的根读取 —— 会话项目根、其 scratch 目录和
+附件库 —— 解析时考虑符号链接，并在读取过程中受限：最多 8 个文件、单文件 32 MiB、
+每个载荷 64 MiB。Host 内部路径不能通过这种方式读取。
+
+| 失败 | 代码 |
+|---|---|
+| 缺少授权，或 `extensionId` 不在该会话已加载集合内 | `PERMISSION_DENIED` |
+| 被拒绝的路径、缺失或为空的 `providerId`、非法方法或请求体形态、超限的请求体或请求头、multipart 分片中的控制字符或路径分隔符、未知的 `timeoutMs` | `INVALID_ARGUMENT` |
+| 没有该 provider 行，或它已被禁用 | `PROVIDER_NOT_FOUND` |
+| `modelId` 不是该 provider 的绑定 | `MODEL_NOT_CONFIGURED` |
+| 该行需要密钥且没有存储 | `PROVIDER_AUTH_MISSING` |
+| v1 中 `authKind === "oauth"` | `PROVIDER_AUTH_UNSUPPORTED` |
+| 传输失败、DNS、TLS、连接被拒 | `NETWORK_ERROR` |
+| 单次调用预算耗尽 | `TIMEOUT` |
+| 调用方、运行时或会话拆除取消了该调用 | `ABORTED` |
+| 响应超过 4 MiB（携带 `status` 与 `bytes`） | `RESPONSE_TOO_LARGE` |
+| 每插件刹车或在途上限 | `RATE_LIMITED` |
+| 该宿主没有传输层（无头的 `pi-host`） | `UNSUPPORTED` |
+| `multipart.files` 路径不存在或不是普通文件 | `FILE_NOT_FOUND` |
+| `multipart.files` 路径解析到项目、scratch 和附件根之外 | `FILE_OUTSIDE_ALLOWED_ROOTS` |
+| 单个上传文件超过其单文件上限 | `FILE_TOO_LARGE` |
+| multipart 载荷超过其总上限 | `UPLOAD_TOO_LARGE` |
+
+取消是双向的：sidecar 铸造 `callId`，随请求发送，并在调用方的 signal 触发时针对该
+id 发送 `extensions.providers.abort`。main 以 `(sessionId, callId)` 为键注册该调用的
+`AbortController`，调用落定时清除它，并在 sidecar 退出或运行时被销毁时中止所有尚未
+完成的调用，因此活得比其 Runner 更久的调用会被丢弃，而不是投递给被替换的 Runner。
+
+HTTP 状态是结果，不是错误码；被拒绝的文件路径、上限或分片形态则抛出异常，因为该请求
+从未离开 Host。
 
 ## 6. 事件映射
 
@@ -265,6 +351,8 @@ v1 不改任何 host-core RPC 方法、协议版本或 SQLite schema。
 | `extensions.model.configure` | 校验插件自有的 provider/模型绑定，经 `session.configure` 持久化，然后广播 `session:modelChanged` |
 | `session.rename`、`session.create`、`session.fork`、`session.queuePush`、`session.queuePrioritize` | 已有方法，现可从适配层到达 |
 | `extensions.providers.list` | 把就绪宿主模型目录投影给会话的扩展，由 `models.list` 门控（ADR 0300） |
+| `extensions.providers.request` | 一次带认证的 provider 请求，由 `provider.request` 把关；以 HTTP 结果或带错误码的失败作答（ADR 0301） |
+| `extensions.providers.abort` | 按 `(sessionId, callId)` 取消在途请求；由传输层作答，不作为请求记入审计 |
 
 ### 10.2 main ↔ 渲染层（Electron IPC）
 
@@ -299,6 +387,7 @@ main 在 `logs/app/plugin.log` 审计每个提示 id。
 |---|---|---|
 | v1 | loader、每会话 Runner、支持矩阵、事件、工具、命令、UI 桥接 | 已交付（D387） |
 | v1.1 | 模块成为带 `agent.extension` 授权的 `contributes.agentExtensions`；把 pi CLI 扩展导入为开发插件；独立注册表和设置标签移除 | 已交付（D388） |
+| v1.1 修订 | 受信任扩展的 provider 访问：由 `models.list` 门控的就绪模型投影，以及面向具名 provider 行发出一次带认证请求的 `provider.request` 面 | 已实现（ADR 0300 / ADR 0301） |
 | v2 | 自定义会话条目（`sendMessage`、`appendEntry`）含 schema 升版和通用渲染、`sessionManager` 只读 shim、`switchSession`、编辑器读写、补全 provider、`registerShortcut`、markdown 转换器 | 已规划，需先决定条目持久化与压缩 |
 | v2 | 自定义会话条目（`sendMessage`、`appendEntry`）与一次 schema 升级及通用渲染层、`sessionManager` 只读 shim、`switchSession`、编辑器读写、自动补全 provider、`registerShortcut`、markdown 转换器 | 计划中，需要就条目持久化与压缩作出决定 |
 | v3 | `pi` 包 manifest 与安装、pi CLI `settings.json` 的只读提示、统一 skill 与提示发现、提示的远程控制路由、市场列出 | 未排期 |
@@ -311,9 +400,9 @@ v1 交付顺序：打包 spike（E2E-245）、shared 协议类型，然后运行
 - 升级任一 pi 包即同时升级三个包。
 - 一组覆盖每个受支持成员的样例扩展在每次升级时作为契约测试运行。
 - 新增的 `ExtensionAPI` 成员先落入“不支持”类别并产生诊断，直到后续决策
-- 新增的 `ExtensionAPI` 成员先落入“不支持”类别并产生诊断，直到后续决策
-  移动它们。成员只在记录该决策的同一次变更中转为受支持：`modelRegistry` 由
-  ADR 0300 移动，其请求类成员将随各自的记录到达。
+  移动它们。成员只在记录该决策的同一次变更中转为受支持：`modelRegistry` 及其目录
+  投影由 ADR 0300 移动，`provider.request` 执行面及其 `provider.request` 授权由
+  ADR 0301 移动。
 - 对外文档只承诺 §5 中“支持”和“上下文上支持”两个类别。
 
 ## 14. 待决事项

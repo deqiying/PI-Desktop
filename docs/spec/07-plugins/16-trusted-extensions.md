@@ -202,8 +202,6 @@ that every third-party extension dependency can execute.
 
 ## 4. Loading and runtime
 
-## 4. Loading and runtime
-
 ### 4.1 Where extensions run
 
 Extensions load inside the Agent sidecar process (`packages/agent-runtime`),
@@ -265,7 +263,7 @@ unsupported ones.
 | Class | Members |
 |---|---|
 | Supported | `registerTool`, `registerCommand`, `registerAgent`, `registerProvider` (plugin-owned compatibility alias; same shape as `registerAgent`), `unregisterAgent`, `unregisterProvider`, `on(...)` for every event in §6, `exec`, `getActiveTools`, `getAllTools`, `setActiveTools`, `getCommands`, `setModel` (configured models and plugin agents; idle-only; persists the current session binding), `getThinkingLevel`, `setThinkingLevel`, `setSessionName`, `getSessionName`, `sendUserMessage` (Host-owned queue, D386), `getFlag` |
-| Supported on context | `ui.notify`, `ui.confirm`, `ui.select`, `ui.input`, `ui.setStatus`, `ui.setWorkingMessage`, `cwd`, `modelRegistry`, `isIdle`, `abort`, `hasPendingMessages`, `getContextUsage`, `compact`, `getSystemPrompt`, `waitForIdle`, `newSession`, `fork` |
+| Supported on context | `ui.notify`, `ui.confirm`, `ui.select`, `ui.input`, `ui.setStatus`, `ui.setWorkingMessage`, `cwd`, `modelRegistry`, `providers`, `isIdle`, `abort`, `hasPendingMessages`, `getContextUsage`, `compact`, `getSystemPrompt`, `waitForIdle`, `newSession`, `fork` |
 | Deferred to v2 | `sendMessage`, `appendEntry`, `setLabel`, `sessionManager` read API, `switchSession`, `registerShortcut`, `registerMarkdownTransformer`, `ui.setEditorText`, `ui.getEditorText`, `ui.addAutocompleteProvider`, `registerFlag` value editing |
 | Unsupported | `ui.setWidget`, `ui.setFooter`, `ui.setHeader`, `ui.setTitle`, `ui.custom`, `ui.overlay`, `ui.onTerminalInput`, `ui.setWorkingVisible`, `ui.setWorkingIndicator`, `ui.setHiddenThinkingLabel`, `ui.pasteToEditor`, `ui.editor`, `registerMessageRenderer`, `registerEntryRenderer`, `navigateTree`, `shutdown` |
 
@@ -307,6 +305,110 @@ keeps its previous answers: its auth status reports configured with
 `source: "runtime"`, its display name is the plugin agent's name, and
 `hasConfiguredAuth` returns true for it. A session id main does not own is
 refused before any catalogue read.
+
+### 5.1 Provider request surface
+
+`ctx.providers.request(input)` issues one authenticated HTTP request to a
+provider row the caller names. It is deliberately not a completion API: the
+caller supplies the path, so the same member reaches `/chat/completions`,
+`/images/generations`, `/embeddings`, or any other path the provider exposes.
+The Host contributes exactly three things and nothing protocol-specific — the
+destination origin, the credential, and the transport policy. It assembles the
+envelope the caller asked for but never interprets it, does not know about
+streaming, and does not map provider responses into PI types (ADR 0301).
+
+| Input | Contract |
+|---|---|
+| `providerId` | Required, never inferred. A call without it is `INVALID_ARGUMENT`; there is no default provider and no fallback to the session model |
+| `modelId` | Optional; selects model-specific provider detail and must be a binding of that provider (`MODEL_NOT_CONFIGURED` otherwise). It is never injected into the body |
+| `path` | Appended to the provider row's `baseUrl`. Validated below |
+| `method` | `GET` (default), `POST`, `PUT`, `PATCH`, `DELETE` |
+| `headers` | Merged under the existing provider-header caps. The Host refuses `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `host`, `content-length`, `content-type`, `connection`, `transfer-encoding`, `upgrade`, `te`, `trailer`, `keep-alive`, `x-api-key`, `api-key`, `chatgpt-account-id`, and any `x-forwarded-*` |
+| `body` | A union: `json` (serialized by the Host), `text`, `base64`, or `multipart`. The Host owns `content-type`, generates the multipart boundary, and never sniffs content; a body on `GET` is refused |
+| `timeoutMs` | Per-call budget: 60 000 default, 300 000 maximum |
+| `signal` | Cancels the call, including a call already in flight |
+
+Destination (normative). The final URL's scheme, host, and port come from the
+provider row's `baseUrl`, and the caller's path is appended to the base path:
+only the path is caller-controlled, there is no implicit `/v1`, and the query
+string is part of the path. A caller string that is empty, over 2048 bytes,
+absolute, scheme-relative, or carries a backslash, a fragment, a control
+character, or a `..` segment — including one that only appears after percent
+decoding, bounded to two passes — is `INVALID_ARGUMENT`. After normalization the
+final origin must equal the base origin and the final pathname must still start
+with the base pathname; the check runs in Electron main, never in the sidecar or
+the extension.
+
+Credentials and transport. The credential is resolved through `providers.get`
+and `providers.getSecret`, and its header is set by the Host **last**, so a
+caller cannot override or forge it. A row that does not exist or is disabled is
+`PROVIDER_NOT_FOUND`; a row that needs a secret it does not have is
+`PROVIDER_AUTH_MISSING`; `authKind: "oauth"` is `PROVIDER_AUTH_UNSUPPORTED` in
+v1, because a vendor account's wire endpoint is model-dependent and its token is
+short-lived. Redirects are **not** followed: a 3xx comes back as a result with
+its `location`, so the credential is never re-sent to a host the provider row
+did not name. There is no automatic retry on this path; a `Retry-After` header
+is surfaced as `retryAfterMs` for the caller to pace itself.
+
+Response. An HTTP response — including 4xx and 5xx — is a **result**, not a Host
+error: it carries `status`, `statusText`, `ok`, `contentType`, headers, and a
+body decoded by shape (`json` when the media type is JSON and parsing succeeds,
+`text` for textual types, `base64` otherwise) with its byte length.
+`set-cookie` and the credential header are stripped from the returned headers. A
+body over 4 MiB is `RESPONSE_TOO_LARGE` rather than truncated.
+
+Grants. `ctx.providers.request` needs the `provider.request` grant (high risk,
+confirmed at install). It reaches the whole provider API surface with the user's
+credential — any path, any method — including endpoints that spend money, so no
+existing permission covers it and every call is audited. The subject is resolved
+from state main owns: the session→project map main populated at launch plus the
+loaded-plugin registry. The wire carries a session id, a *claimed*
+`extensionId`, and a `callId`; an id outside the session's loaded extension set
+is refused, and the claimed id is used for audit attribution only. Without the
+grant the call is `PERMISSION_DENIED` with an audit line. Two plugins
+contributing extensions to one session cannot be told apart at runtime (their
+modules share one process), so the gate is the union of their grants — a
+recorded residual limit, not isolation.
+
+Brakes. Requests share the plugin host's `agent.complete` counter (8 per rolling
+60 s per plugin), at most 4 are in flight per plugin, and each has its own
+budget. The audit line records the method, the status, the duration, the file
+count, and the byte size — never a path, a header value, a field value, or a
+credential.
+
+Uploads. A `multipart.files` entry is read only from roots the session owns —
+the session's project root, its scratch directory, and the attachment store —
+resolved symlink-aware and bounded while reading, under 8 files, 32 MiB per
+file, and 64 MiB per payload. Host-internal paths are not readable this way.
+
+| Failure | Code |
+|---|---|
+| Grant missing, or an `extensionId` outside the session's loaded set | `PERMISSION_DENIED` |
+| Rejected path, missing or empty `providerId`, bad method or body shape, oversized body or header, control character or path separator in a multipart part, unknown `timeoutMs` | `INVALID_ARGUMENT` |
+| No such provider row, or it is disabled | `PROVIDER_NOT_FOUND` |
+| `modelId` is not a binding of that provider | `MODEL_NOT_CONFIGURED` |
+| The row needs a secret and none is stored | `PROVIDER_AUTH_MISSING` |
+| `authKind === "oauth"` in v1 | `PROVIDER_AUTH_UNSUPPORTED` |
+| Transport failure, DNS, TLS, refused connection | `NETWORK_ERROR` |
+| The per-call budget expired | `TIMEOUT` |
+| The caller, the runtime, or session teardown cancelled the call | `ABORTED` |
+| The response exceeded 4 MiB (carries `status` and `bytes`) | `RESPONSE_TOO_LARGE` |
+| The per-plugin brake or the in-flight cap | `RATE_LIMITED` |
+| No transport on this host (the headless `pi-host`) | `UNSUPPORTED` |
+| A `multipart.files` path does not exist or is not a regular file | `FILE_NOT_FOUND` |
+| A `multipart.files` path resolves outside the project, scratch, and attachment roots | `FILE_OUTSIDE_ALLOWED_ROOTS` |
+| One uploaded file exceeds its per-file cap | `FILE_TOO_LARGE` |
+| The multipart payload exceeds its total cap | `UPLOAD_TOO_LARGE` |
+
+Cancellation is bidirectional: the sidecar mints a `callId`, sends it with the
+request, and sends `extensions.providers.abort` for that id when the caller's
+signal fires. Main registers the call's `AbortController` under
+`(sessionId, callId)`, clears it when the call settles, and aborts every
+outstanding call when the sidecar exits or the runtime is disposed, so a call
+that outlives its Runner is discarded rather than delivered to a replaced one.
+
+HTTP statuses are results, not codes; a rejected file path, cap, or part shape
+throws instead, because the request never left the Host.
 
 ## 6. Event mapping
 
@@ -405,6 +507,8 @@ No host-core RPC method, protocol version, or SQLite schema changes in v1.
 | `extensions.model.configure` | Validate and persist a plugin-owned provider/model binding through `session.configure`, then broadcast `session:modelChanged` |
 | `session.rename`, `session.create`, `session.fork`, `session.queuePush`, `session.queuePrioritize` | Existing methods, now reachable from the adapter |
 | `extensions.providers.list` | Project the ready host-model catalogue to the session's extensions, gated by `models.list` (ADR 0300) |
+| `extensions.providers.request` | One authenticated provider request, gated by `provider.request`; answers with the HTTP result or a coded failure (ADR 0301) |
+| `extensions.providers.abort` | Cancel an in-flight request by its `(sessionId, callId)`; answered by the transport, not audited as a request |
 
 ### 10.2 Main ↔ renderer (Electron IPC)
 
@@ -443,6 +547,7 @@ The Plugins page shows agent extensions on the owning plugin's row:
 | v1 | Loader, Runner per session, support matrix, events, tools, commands, UI bridge | Shipped (D387) |
 | v1.1 | Modules become `contributes.agentExtensions` with the `agent.extension` grant; import of pi CLI extensions as development plugins; the standalone registry and settings tab are removed | Shipped (D388) |
 | v1.1 amendment | Plugin-owned custom agents via `registerAgent`, provider compatibility alias, redacted model registry, idle-only session binding and restore through `extension-agent:` ids | Implemented (D426 / ADR 0258) |
+| v1.1 amendment | Trusted-extension provider access: the ready-model projection gated by `models.list`, and the `provider.request` surface for one authenticated request to a named provider row | Implemented (ADR 0300 / ADR 0301) |
 | v2 | Custom session entries (`sendMessage`, `appendEntry`) with a schema bump and a generic renderer, `sessionManager` read shim, `switchSession`, editor read and write, autocomplete providers, `registerShortcut`, markdown transformers | Planned, needs a decision on entry persistence and compaction |
 | v3 | `pi` package manifests and installation, read-only hints from the pi CLI's `settings.json`, unified skill and prompt discovery, remote-control routing for prompts, marketplace listing | Not scheduled |
 
@@ -455,10 +560,10 @@ runtime, main, and renderer tracks in parallel.
 - A fixture set of sample extensions covering each supported member runs as a
   contract test on every upgrade.
 - New `ExtensionAPI` members land in the Unsupported class with a
-- New `ExtensionAPI` members land in the Unsupported class with a
   diagnostic until a later decision moves them. A member becomes supported only
-  in the change that records that decision: `modelRegistry` moved by ADR 0300,
-  whose request members arrive with their own record.
+  in the change that records that decision: `modelRegistry` and its catalogue
+  projection moved by ADR 0300, and the `provider.request` execution surface
+  with the `provider.request` grant by ADR 0301.
 - Public documentation promises only the Supported and Supported-on-context
   classes in §5.
 
