@@ -1,41 +1,67 @@
 /**
- * Policy layer for the trusted-extension host-proxy methods (plan S1/D7).
+ * Policy layer for the trusted-extension host-proxy methods (plan S1/S2, D7/D8).
  *
- * S1 only needs the read handler: `extensions.providers.list`. It answers with
- * the ready-model catalogue for the session the call came from, and only when
- * one of the plugins contributing extensions to that session holds
- * `models.list`.
+ * The subject of every call is resolved from state main owns — the
+ * session→project map main populated at launch plus the loaded-plugin registry —
+ * never from the wire. The wire carries a session id, a *claimed* `extensionId`,
+ * and a `callId`; only the first two are used to decide, and the claimed id must
+ * belong to the session's loaded extension set before anything is read or sent.
  *
- * The subject is resolved from state main owns — the session→project map main
- * populated at launch plus the loaded-plugin registry — never from the wire,
- * which carries only `sessionId`. An id absent from that map is refused without
- * a catalogue read, so a module cannot name another session's id to borrow its
- * project grant, and an unknown id cannot degrade to "global plugins apply".
- * Two plugins contributing to one session cannot be told apart at runtime
- * (their modules share one process), so the gate is the union of their grants;
- * that residual limit is recorded in the plan (D7).
+ * Two plugins contributing extensions to one session cannot be told apart at
+ * runtime (their modules share one process), so a grant check is the **union of
+ * the contributing plugins' grants**. That residual limit is recorded in the
+ * plan (D7) and is why the real force is install-time consent, per-call audit,
+ * a shared rate brake, and an in-flight cap rather than isolation.
  */
-
-import type { HostModelDescriptor } from "@pi-desktop/agent-runtime";
+import type {
+  ExtensionProviderRequestResult,
+  HostModelDescriptor,
+} from "@pi-desktop/agent-runtime";
 import type { HostProcess } from "../host-process";
 import type { ExtensionModelCatalog } from "./extension-model-catalog";
+import { requestErrorCode } from "./extension-request-envelope";
+import {
+  type ExtensionProviderRequestHandler,
+  type ProviderRequestSubject,
+} from "./extension-provider-request";
+import { providerRequestAudit } from "./extension-request-response";
 
 /** The permission a plugin must hold for its extensions to read the catalogue. */
 const MODELS_LIST_PERMISSION = "models.list";
+/**
+ * The permission a plugin must hold for its extensions to issue a provider
+ * request (plan D7). It reaches the whole provider API surface with the user's
+ * credential — any path, any method — so it is its own high-risk grant.
+ */
+const PROVIDER_REQUEST_PERMISSION = "provider.request";
 
-/** Audit operation name; matches the permission the call is gated by. */
-const AUDIT_API = "models.list";
+/** Audit operation names; each matches the permission its call is gated by. */
+const CATALOGUE_AUDIT_API = "models.list";
+
+/** D8: at most four calls per plugin in flight, so a fan-out cannot pile up. */
+const MAX_IN_FLIGHT_PER_PLUGIN = 4;
 
 export type ExtensionProviderAccess = {
   listProviderModels(params: unknown): Promise<{ models: HostModelDescriptor[] }>;
+  requestProvider(params: unknown): Promise<ExtensionProviderRequestResult>;
+  abortProviderRequest(params: unknown): { ok: boolean };
+  /** Runtime disposal: every call this layer started is aborted (plan D8). */
+  abortAllProviderRequests(): void;
 };
 
 export type ExtensionProviderAccessOptions = {
   catalog: ExtensionModelCatalog;
+  providerRequest: ExtensionProviderRequestHandler;
   getHost: () => Pick<HostProcess, "call"> | null;
   activeInProject: (pluginId: string, projectPath: string | null) => boolean;
   /** Same sink shape as the plugin host services' audit callback. */
   audit: (entry: Record<string, unknown>) => void;
+  /**
+   * The rate brake, shared with the plugin host's `agent.complete` counter
+   * (D8): one spend surface per plugin must not buy two budgets by alternating
+   * calls. Returns false when the plugin is over the window.
+   */
+  consumeRequestBudget: (pluginId: string) => boolean;
   plugins: {
     getAgentExtensions(): Array<{ pluginId: string; id: string }>;
     pluginHasPermission(pluginId: string, permission: string): boolean;
@@ -47,66 +73,126 @@ export type ExtensionProviderAccessOptions = {
   sessionProjects: Map<string, string | null>;
 };
 
-/** A session id is the only identity the wire carries; an empty one is refused. */
+/** A session id is the only identity the wire carries for the subject. */
 function sessionIdOf(params: unknown): string {
   if (!params || typeof params !== "object") return "";
   const value = (params as { sessionId?: unknown }).sessionId;
   return typeof value === "string" ? value.trim() : "";
 }
 
+function callIdOf(params: unknown): string {
+  if (!params || typeof params !== "object") return "";
+  const value = (params as { callId?: unknown }).callId;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function extensionIdOf(params: unknown): string {
+  if (!params || typeof params !== "object") return "";
+  const value = (params as { extensionId?: unknown }).extensionId;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function denied(errorCode: string, message: string): Error {
+  return Object.assign(new Error(message), { errorCode });
+}
+
 export function createExtensionProviderAccess(
   options: ExtensionProviderAccessOptions,
 ): ExtensionProviderAccess {
-  const { catalog, getHost, activeInProject, audit, plugins, sessionProjects } =
-    options;
+  const {
+    catalog,
+    providerRequest,
+    getHost,
+    activeInProject,
+    audit,
+    consumeRequestBudget,
+    plugins,
+    sessionProjects,
+  } = options;
 
-  /** One denial row, attributed to whatever identity the call could carry. */
-  const deny = (
+  /** D8's in-flight cap, counted per owning plugin. */
+  const inFlight = new Map<string, number>();
+
+  /**
+   * Resolve the subject from main-owned state, or the code that refuses the
+   * call. Both host-proxy methods share it: an unknown session is refused
+   * before any catalogue read or provider lookup, and each method names the
+   * grant it needs.
+   */
+  const resolveSubject = (
+    params: unknown,
+    permission: string,
+  ):
+    | {
+        sessionId: string;
+        projectPath: string | null;
+        pluginIds: string[];
+        contributing: Array<{ pluginId: string; id: string }>;
+      }
+    | { denied: Error; sessionId: string; pluginIds: string[] } => {
+    const sessionId = sessionIdOf(params);
+    const host = getHost();
+    if (!host || !sessionId || !sessionProjects.has(sessionId)) {
+      return {
+        denied: denied("PERMISSION_DENIED", "No session owns this call"),
+        sessionId,
+        pluginIds: [],
+      };
+    }
+    const projectPath = sessionProjects.get(sessionId) ?? null;
+    const contributing = plugins
+      .getAgentExtensions()
+      .filter((extension) => activeInProject(extension.pluginId, projectPath));
+    const pluginIds = [...new Set(contributing.map((e) => e.pluginId))];
+    if (
+      !contributing.some((extension) =>
+        plugins.pluginHasPermission(extension.pluginId, permission),
+      )
+    ) {
+      return {
+        denied: denied("PERMISSION_DENIED", `The ${permission} grant is missing`),
+        sessionId,
+        pluginIds,
+      };
+    }
+    return { sessionId, projectPath, pluginIds, contributing };
+  };
+
+  /** One audited refusal, then the same code to the caller. */
+  const refuse = (
     sessionId: string,
     pluginIds: string[],
-  ): { models: HostModelDescriptor[] } => {
-    audit({
-      api: AUDIT_API,
-      ok: false,
-      errorCode: "PERMISSION_DENIED",
-      count: 0,
-      sessionId,
-      pluginIds,
-      ts: Date.now(),
-    });
-    return { models: [] };
+    error: Error,
+  ): never => {
+    audit(
+      providerRequestAudit({
+        ok: false,
+        sessionId,
+        pluginIds,
+        ts: Date.now(),
+        errorCode: requestErrorCode(error),
+      }),
+    );
+    throw error;
   };
 
   const listProviderModels = async (
     params: unknown,
   ): Promise<{ models: HostModelDescriptor[] }> => {
-    const sessionId = sessionIdOf(params);
-    const host = getHost();
-    // `sessionId` is wire input. Without a live host, or without a session main
-    // actually owns, there is no subject to check: the answer is a denial, not
-    // an empty success, and no catalogue read happens.
-    if (!host || !sessionId || !sessionProjects.has(sessionId)) {
-      return deny(sessionId, []);
+    const subject = resolveSubject(params, MODELS_LIST_PERMISSION);
+    if ("denied" in subject) {
+      audit({
+        api: CATALOGUE_AUDIT_API,
+        ok: false,
+        errorCode: "PERMISSION_DENIED",
+        count: 0,
+        sessionId: subject.sessionId,
+        pluginIds: subject.pluginIds,
+        ts: Date.now(),
+      });
+      return { models: [] };
     }
-
-    const projectPath = sessionProjects.get(sessionId) ?? null;
-    const contributing = plugins
-      .getAgentExtensions()
-      .filter((extension) => activeInProject(extension.pluginId, projectPath));
-    const pluginIds = [
-      ...new Set(contributing.map((extension) => extension.pluginId)),
-    ];
-    if (
-      !contributing.some((extension) =>
-        plugins.pluginHasPermission(
-          extension.pluginId,
-          MODELS_LIST_PERMISSION,
-        ),
-      )
-    ) {
-      return deny(sessionId, pluginIds);
-    }
-
+    const { sessionId, pluginIds } = subject;
     // A catalogue failure rejects the call instead of answering "no models":
     // an unreachable host and a host with no ready models must not look alike.
     // The rejected call is still audited, so a granted-then-failed call leaves
@@ -116,7 +202,7 @@ export function createExtensionProviderAccess(
       models = await catalog.listReadyModels();
     } catch (error) {
       audit({
-        api: AUDIT_API,
+        api: CATALOGUE_AUDIT_API,
         ok: false,
         errorCode: "UNSUPPORTED",
         count: 0,
@@ -127,7 +213,7 @@ export function createExtensionProviderAccess(
       throw error;
     }
     audit({
-      api: AUDIT_API,
+      api: CATALOGUE_AUDIT_API,
       ok: true,
       count: models.length,
       sessionId,
@@ -137,5 +223,83 @@ export function createExtensionProviderAccess(
     return { models };
   };
 
-  return { listProviderModels };
+  const requestProvider = async (
+    params: unknown,
+  ): Promise<ExtensionProviderRequestResult> => {
+    const subject = resolveSubject(params, PROVIDER_REQUEST_PERMISSION);
+    if ("denied" in subject) {
+      return refuse(subject.sessionId, subject.pluginIds, subject.denied);
+    }
+    const { sessionId, projectPath, pluginIds, contributing } = subject;
+
+    const extensionId = extensionIdOf(params);
+    const claimed = contributing.find((extension) => extension.id === extensionId);
+    // The claimed id must belong to the session's loaded set: an id from
+    // nowhere is not an identity, and the audit line names only real plugins.
+    if (!claimed) {
+      return refuse(
+        sessionId,
+        pluginIds,
+        denied("PERMISSION_DENIED", "Unknown extension id for this session"),
+      );
+    }
+    const callId = callIdOf(params);
+    if (!callId) {
+      return refuse(
+        sessionId,
+        pluginIds,
+        denied("INVALID_ARGUMENT", "callId is required"),
+      );
+    }
+    // The in-flight cap is checked first: a call refused for congestion never
+    // reached the provider, so it must not also spend the plugin's allowance.
+    const owner = claimed.pluginId;
+    if ((inFlight.get(owner) ?? 0) >= MAX_IN_FLIGHT_PER_PLUGIN) {
+      return refuse(
+        sessionId,
+        pluginIds,
+        denied(
+          "RATE_LIMITED",
+          "Too many provider requests are already in flight for this plugin",
+        ),
+      );
+    }
+    // The brake is charged to the plugin that owns the claimed extension, so a
+    // plugin cannot spend a sibling's allowance by naming its extension.
+    if (!consumeRequestBudget(owner)) {
+      return refuse(
+        sessionId,
+        pluginIds,
+        denied("RATE_LIMITED", "The provider request rate limit was reached"),
+      );
+    }
+
+    inFlight.set(owner, (inFlight.get(owner) ?? 0) + 1);
+    try {
+      // The transport audits its own outcome (one row per call, including the
+      // refusals it decides), so this layer only releases the slot.
+      return await providerRequest.perform(params as Record<string, unknown>, {
+        sessionId,
+        ...(projectPath ? { projectPath } : {}),
+        pluginIds,
+        extensionId,
+        callId,
+      } satisfies ProviderRequestSubject);
+    } finally {
+      const remaining = (inFlight.get(owner) ?? 1) - 1;
+      if (remaining > 0) inFlight.set(owner, remaining);
+      else inFlight.delete(owner);
+    }
+  };
+  return {
+    listProviderModels,
+    requestProvider,
+    // Aborting is a side channel, not a call the surface reports on: it is
+    // answered by the transport and never audited as a request of its own.
+    abortProviderRequest: (params) => providerRequest.abort(params),
+    abortAllProviderRequests: () => {
+      inFlight.clear();
+      providerRequest.abortAll();
+    },
+  };
 }
