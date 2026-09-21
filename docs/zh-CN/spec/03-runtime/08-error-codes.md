@@ -250,8 +250,10 @@ reveal 不并入任何行，必须重新读取。
 
 由桌面进程为 `ctx.providers.request` 发出（规格 16 §5.1），并经 sidecar 宿主代理原样
 带到扩展。上文已登记的代码保留其既有含义：`INVALID_ARGUMENT`、
-`MODEL_NOT_CONFIGURED`、`NETWORK_ERROR`、`TIMEOUT`、`RATE_LIMITED` 和
-`UNSUPPORTED`（宿主没有 provider 传输层，例如无头的 `pi-host`）。
+`MODEL_NOT_CONFIGURED`、`NETWORK_ERROR`、`TIMEOUT`、`RATE_LIMITED`、`UNSUPPORTED`
+（宿主没有 provider 传输层，例如无头的 `pi-host`）、`HOST_UNAVAILABLE`（一次
+`providers.get` / `providers.getSecret` 往返失败且没有自己的代码），以及 `INTERNAL`
+（不带任何代码的意外 Host 失败）。
 
 | 代码 | 可重试 | 含义 |
 |---|---|---|
@@ -267,8 +269,8 @@ reveal 不并入任何行，必须重新读取。
 | `UPLOAD_TOO_LARGE` | 否 | multipart 载荷超过其 64 MiB 总上限 |
 
 HTTP 状态 —— 包括 3xx、4xx 和 5xx —— 是**结果**，永远不会是这些代码之一：协议由
-调用方拥有。被拒绝的路径、请求头、请求体、分片形态或上传会抛出异常，因为该请求从未
-离开桌面进程。
+调用方拥有。被拒绝的路径、请求头、请求体、分片形态，或 Host 无法读取的上传会抛出
+异常，因为该请求从未离开桌面进程。
 
 ### 3. 7 保留的详细代码（尚未发布）
 

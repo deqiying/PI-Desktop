@@ -255,8 +255,11 @@ malformed.
 Emitted by the desktop process for `ctx.providers.request` (spec 16 §5.1) and
 carried to the extension unchanged over the sidecar host proxy. Codes already
 registered above keep their existing meaning: `INVALID_ARGUMENT`,
-`MODEL_NOT_CONFIGURED`, `NETWORK_ERROR`, `TIMEOUT`, `RATE_LIMITED`, and
-`UNSUPPORTED` (a host with no provider transport, e.g. the headless `pi-host`).
+`MODEL_NOT_CONFIGURED`, `NETWORK_ERROR`, `TIMEOUT`, `RATE_LIMITED`, `UNSUPPORTED`
+(a host with no provider transport, e.g. the headless `pi-host`),
+`HOST_UNAVAILABLE` (a `providers.get` / `providers.getSecret` round trip failed
+without a code of its own), and `INTERNAL` (an unexpected Host failure that
+carries no code at all).
 
 | code | retriable | meaning |
 |---|---|---|
@@ -273,7 +276,8 @@ registered above keep their existing meaning: `INVALID_ARGUMENT`,
 
 An HTTP status — including 3xx, 4xx, and 5xx — is a **result**, never one of
 these codes: the caller owns the protocol. A rejected path, header, body, part
-shape, or upload throws, because the request never left the desktop process.
+shape, or an upload the Host cannot read throws, because the request never left
+the desktop process.
 
 ### 3.7 Reserved detail codes (not yet emitted)
 

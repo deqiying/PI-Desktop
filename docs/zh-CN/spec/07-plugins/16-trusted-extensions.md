@@ -192,7 +192,7 @@ main、渲染层或插件宿主进程中。
 | 输入 | 契约 |
 |---|---|
 | `providerId` | 必填，永不推断。缺少它的调用是 `INVALID_ARGUMENT`；没有默认 provider，也不回退到会话模型 |
-| `modelId` | 可选；用于选择模型级的 provider 细节，且必须是该 provider 的绑定（否则为 `MODEL_NOT_CONFIGURED`）。它永不注入请求体 |
+| `modelId` | 可选；用于选择模型级的 provider 细节，且必须是该 provider 的模型之一，包括其 `defaultModelId`（否则为 `MODEL_NOT_CONFIGURED`）。它永不注入请求体 |
 | `path` | 追加到 provider 行的 `baseUrl` 之后。校验见下文 |
 | `method` | `GET`（默认）、`POST`、`PUT`、`PATCH`、`DELETE` |
 | `headers` | 在既有 provider 请求头上限之内合并。Host 拒绝 `authorization`、`proxy-authorization`、`cookie`、`set-cookie`、`host`、`content-length`、`content-type`、`connection`、`transfer-encoding`、`upgrade`、`te`、`trailer`、`keep-alive`、`x-api-key`、`api-key`、`chatgpt-account-id` 以及任何 `x-forwarded-*` |
@@ -203,10 +203,12 @@ main、渲染层或插件宿主进程中。
 目的地（规范性）。最终 URL 的 scheme、host 和 port 来自 provider 行的 `baseUrl`，
 调用方的路径追加到基础路径之后：只有路径由调用方控制，没有隐式的 `/v1`，查询字符串
 属于路径的一部分。调用方字符串若为空、超过 2048 字节、是绝对 URL、是相对 scheme 的
-URL，或携带反斜杠、片段、控制字符，或含 `..` 路径段 —— 包括只在百分号解码之后才出现
-的那种（解码最多两轮）—— 都是 `INVALID_ARGUMENT`。规范化之后，最终 origin 必须等于
-基础 origin，且最终 pathname 仍必须以基础 pathname 开头；该校验在 Electron main 中
-执行，永不在 sidecar 或扩展中执行。
+URL，或携带反斜杠、片段、控制字符，或含 `..` 路径段 —— 包括只在路径的百分号解码之后
+才出现的那种（解码最多两轮）—— 都是 `INVALID_ARGUMENT`。查询字符串是调用方自己的
+数据，原样透传、不做解码，因此其中的 `..` 或 `%` 既不会逃出基础前缀，也不会让调用被
+拒绝。规范化之后，最终 origin 必须等于基础 origin，且解码后的最终 pathname 必须以
+解码后的基础 pathname 开头；该校验在 Electron main 中执行，永不在 sidecar 或扩展中
+执行。
 
 凭据与传输。凭据经 `providers.get` 与 `providers.getSecret` 解析，其请求头由 Host
 **最后**设置，因此调用方无法覆盖或伪造它。不存在或已被禁用的行是
@@ -232,8 +234,12 @@ URL，或携带反斜杠、片段、控制字符，或含 `..` 路径段 —— 
 并集 —— 这是已记录的残余限制，不是隔离。
 
 刹车。请求与插件宿主共享 `agent.complete` 计数器（每个插件每滚动 60 秒 8 次），
-每个插件最多 4 个在途，且各自有独立预算。审计行记录方法、状态、耗时、文件数和字节
-大小 —— 永不含路径、请求头值、字段值或凭据。
+每个插件最多 4 个在途，且各自有独立预算，预算从 main 接受该调用的那一刻起算，因此
+provider 解析和上传读取都无法跑到它之外。在离开 Host 之前就被拒绝的调用 —— 参数被
+拒、provider 不可用、在途上限 —— 不消耗配额；刹车在请求即将派发时才计费。审计行记录
+扩展 id、刹车计费到的插件、会话中贡献扩展的插件、provider 与 model id、方法、去掉
+查询字符串的最终路径、状态、耗时、文件数，以及请求与响应字节大小 —— 永不含查询字符串、
+请求头值、字段值或凭据。
 
 上传。`multipart.files` 条目只从会话拥有的根读取 —— 会话项目根、其 scratch 目录和
 附件库 —— 解析时考虑符号链接，并在读取过程中受限：最多 8 个文件、单文件 32 MiB、
@@ -242,12 +248,14 @@ URL，或携带反斜杠、片段、控制字符，或含 `..` 路径段 —— 
 | 失败 | 代码 |
 |---|---|
 | 缺少授权，或 `extensionId` 不在该会话已加载集合内 | `PERMISSION_DENIED` |
-| 被拒绝的路径、缺失或为空的 `providerId`、非法方法或请求体形态、超限的请求体或请求头、multipart 分片中的控制字符或路径分隔符、未知的 `timeoutMs` | `INVALID_ARGUMENT` |
+| 被拒绝的路径、缺失或为空的 `providerId`、非法方法或请求体形态、超限的请求体或请求头、multipart 分片中的控制字符或路径分隔符、未知的 `timeoutMs`、Host 无法读取的 `multipart.files` 条目，或不是 Host 所记录目录的会话 scratch 根 | `INVALID_ARGUMENT` |
 | 没有该 provider 行，或它已被禁用 | `PROVIDER_NOT_FOUND` |
 | `modelId` 不是该 provider 的绑定 | `MODEL_NOT_CONFIGURED` |
 | 该行需要密钥且没有存储 | `PROVIDER_AUTH_MISSING` |
 | v1 中 `authKind === "oauth"` | `PROVIDER_AUTH_UNSUPPORTED` |
 | 传输失败、DNS、TLS、连接被拒 | `NETWORK_ERROR` |
+| `providers.get` 或 `providers.getSecret` 往返失败且没有自己的代码（宿主不可达） | `HOST_UNAVAILABLE` |
+| 不带自身代码的意外 Host 失败 | `INTERNAL` |
 | 单次调用预算耗尽 | `TIMEOUT` |
 | 调用方、运行时或会话拆除取消了该调用 | `ABORTED` |
 | 响应超过 4 MiB（携带 `status` 与 `bytes`） | `RESPONSE_TOO_LARGE` |
@@ -258,10 +266,13 @@ URL，或携带反斜杠、片段、控制字符，或含 `..` 路径段 —— 
 | 单个上传文件超过其单文件上限 | `FILE_TOO_LARGE` |
 | multipart 载荷超过其总上限 | `UPLOAD_TOO_LARGE` |
 
-取消是双向的：sidecar 铸造 `callId`，随请求发送，并在调用方的 signal 触发时针对该
-id 发送 `extensions.providers.abort`。main 以 `(sessionId, callId)` 为键注册该调用的
-`AbortController`，调用落定时清除它，并在 sidecar 退出或运行时被销毁时中止所有尚未
-完成的调用，因此活得比其 Runner 更久的调用会被丢弃，而不是投递给被替换的 Runner。
+取消是双向的：sidecar 铸造 `callId`，随请求发送，并在调用方的 signal 触发或其自身
+截止时间到达时针对该 id 发送 `extensions.providers.abort`。main 在接受该调用的那一刻
+—— 早于 provider 解析和任何上传读取 —— 就以 `(sessionId, callId)` 为键注册该调用的
+`AbortController`，因此在预检期间到达的中止会被遵守而不是被抢先跑完；调用落定时清除
+该条目，并在 sidecar 退出或运行时被销毁时中止所有尚未完成的调用，因此活得比其 Runner
+更久的调用会被丢弃，而不是投递给被替换的 Runner。main 不拥有的会话 id 无法触达一个
+存活的调用。
 
 HTTP 状态是结果，不是错误码；被拒绝的文件路径、上限或分片形态则抛出异常，因为该请求
 从未离开 Host。

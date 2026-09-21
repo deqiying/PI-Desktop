@@ -320,7 +320,7 @@ streaming, and does not map provider responses into PI types (ADR 0301).
 | Input | Contract |
 |---|---|
 | `providerId` | Required, never inferred. A call without it is `INVALID_ARGUMENT`; there is no default provider and no fallback to the session model |
-| `modelId` | Optional; selects model-specific provider detail and must be a binding of that provider (`MODEL_NOT_CONFIGURED` otherwise). It is never injected into the body |
+| `modelId` | Optional; selects model-specific provider detail and must be one of that provider's models, including its `defaultModelId` (`MODEL_NOT_CONFIGURED` otherwise). It is never injected into the body |
 | `path` | Appended to the provider row's `baseUrl`. Validated below |
 | `method` | `GET` (default), `POST`, `PUT`, `PATCH`, `DELETE` |
 | `headers` | Merged under the existing provider-header caps. The Host refuses `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `host`, `content-length`, `content-type`, `connection`, `transfer-encoding`, `upgrade`, `te`, `trailer`, `keep-alive`, `x-api-key`, `api-key`, `chatgpt-account-id`, and any `x-forwarded-*` |
@@ -334,10 +334,12 @@ only the path is caller-controlled, there is no implicit `/v1`, and the query
 string is part of the path. A caller string that is empty, over 2048 bytes,
 absolute, scheme-relative, or carries a backslash, a fragment, a control
 character, or a `..` segment — including one that only appears after percent
-decoding, bounded to two passes — is `INVALID_ARGUMENT`. After normalization the
-final origin must equal the base origin and the final pathname must still start
-with the base pathname; the check runs in Electron main, never in the sidecar or
-the extension.
+decoding the path, bounded to two passes — is `INVALID_ARGUMENT`. The query is
+the caller's own data and is passed through undecoded, so a `..` or a `%` inside
+it neither escapes the base prefix nor refuses the call. After normalization the
+final origin must equal the base origin and the decoded final pathname must start
+with the decoded base pathname; the check runs in Electron main, never in the
+sidecar or the extension.
 
 Credentials and transport. The credential is resolved through `providers.get`
 and `providers.getSecret`, and its header is set by the Host **last**, so a
@@ -372,9 +374,15 @@ recorded residual limit, not isolation.
 
 Brakes. Requests share the plugin host's `agent.complete` counter (8 per rolling
 60 s per plugin), at most 4 are in flight per plugin, and each has its own
-budget. The audit line records the method, the status, the duration, the file
-count, and the byte size — never a path, a header value, a field value, or a
-credential.
+budget, measured from the moment main accepts the call so provider resolution
+and an upload read cannot run outside it. A call refused before it leaves the
+Host — a rejected argument, an unavailable provider, the in-flight cap — spends
+no allowance; the brake is charged when the request is about to be dispatched.
+The audit line records the extension id, the plugin the brake is charged to, the
+session's contributing plugins, the provider and model ids, the method, the final
+path without its query, the status, the duration, the file count, and the request
+and response byte sizes — never the query string, a header value, a field value,
+or a credential.
 
 Uploads. A `multipart.files` entry is read only from roots the session owns —
 the session's project root, its scratch directory, and the attachment store —
@@ -384,12 +392,14 @@ file, and 64 MiB per payload. Host-internal paths are not readable this way.
 | Failure | Code |
 |---|---|
 | Grant missing, or an `extensionId` outside the session's loaded set | `PERMISSION_DENIED` |
-| Rejected path, missing or empty `providerId`, bad method or body shape, oversized body or header, control character or path separator in a multipart part, unknown `timeoutMs` | `INVALID_ARGUMENT` |
+| Rejected path, missing or empty `providerId`, bad method or body shape, oversized body or header, control character or path separator in a multipart part, unknown `timeoutMs`, a `multipart.files` entry the Host cannot read, or a session scratch root that is not the directory the Host recorded | `INVALID_ARGUMENT` |
 | No such provider row, or it is disabled | `PROVIDER_NOT_FOUND` |
 | `modelId` is not a binding of that provider | `MODEL_NOT_CONFIGURED` |
 | The row needs a secret and none is stored | `PROVIDER_AUTH_MISSING` |
 | `authKind === "oauth"` in v1 | `PROVIDER_AUTH_UNSUPPORTED` |
 | Transport failure, DNS, TLS, refused connection | `NETWORK_ERROR` |
+| A `providers.get` or `providers.getSecret` round trip failed without a code (the host is unreachable) | `HOST_UNAVAILABLE` |
+| An unexpected Host failure that carries no code of its own | `INTERNAL` |
 | The per-call budget expired | `TIMEOUT` |
 | The caller, the runtime, or session teardown cancelled the call | `ABORTED` |
 | The response exceeded 4 MiB (carries `status` and `bytes`) | `RESPONSE_TOO_LARGE` |
@@ -402,10 +412,14 @@ file, and 64 MiB per payload. Host-internal paths are not readable this way.
 
 Cancellation is bidirectional: the sidecar mints a `callId`, sends it with the
 request, and sends `extensions.providers.abort` for that id when the caller's
-signal fires. Main registers the call's `AbortController` under
-`(sessionId, callId)`, clears it when the call settles, and aborts every
-outstanding call when the sidecar exits or the runtime is disposed, so a call
-that outlives its Runner is discarded rather than delivered to a replaced one.
+signal fires or its own deadline passes. Main registers the call's
+`AbortController` under `(sessionId, callId)` as soon as it accepts the call —
+before provider resolution and any upload read — so an abort that lands during
+pre-flight is honored rather than outrun, clears the entry when the call
+settles, and aborts every outstanding call when the sidecar exits or the runtime
+is disposed, so a call that outlives its Runner is discarded rather than
+delivered to a replaced one. A session id main does not own cannot reach a live
+call.
 
 HTTP statuses are results, not codes; a rejected file path, cap, or part shape
 throws instead, because the request never left the Host.

@@ -364,15 +364,21 @@ before anything can inspect it:
    not the primary gate.
 2. Validate the caller string **before** any URL construction: non-empty, ≤ 2048
    bytes, no `\`, no `#`, no CR/LF/NUL or other control characters, not starting
-   with `//`. Percent-decode (bounded to two passes) and reject if any `..`
-   segment appears in the decoded form.
+   with `//`. Split off the query, percent-decode the path part (bounded to two
+   passes, the second tolerant of a `%` the first one produced), and reject if
+   any `..` segment appears in the decoded form. The query is the caller's own
+   data and is passed through untouched: a `..` or a bare `%` in it neither
+   escapes the base prefix nor refuses the call.
 3. Compose: `pathname = base.pathname.replace(/\/+$/, "") + "/" +
    callerPath.replace(/^\/+/, "")`, then set `search` from the caller's query if
    present.
 4. Normalize, then assert the final `origin` equals the base origin **and** the
-   final pathname starts with the normalized base pathname. Reject otherwise.
-   This second check is the belt-and-braces layer: it catches any encoding that
-   survived step 2, because such a path would resolve out of the base prefix.
+   decoded final pathname starts with the decoded base pathname. Reject
+   otherwise. This second check is the belt-and-braces layer: it catches any
+   encoding that survived step 2, because such a path would resolve out of the
+   base prefix. Both sides are decoded because the URL parser percent-encodes
+   either of them, and a decoded pathname measured against a raw base path would
+   refuse every call to `https://host/v1%20beta`.
 
 No implicit `/v1`. The provider row's `baseUrl` is used as configured and the
 caller's path is appended to it, exactly as specified. A caller that needs `/v1`
@@ -506,9 +512,9 @@ stage, not afterwards (§9).
 
 | Control | Value | Basis |
 |---|---|---|
-| Rate | 8 requests / rolling 60 s per plugin, one counter shared with the plugin host's `agent.complete` brake (`plugin-runtime.ts:678-681`, `:3944-3953`) | same plugin, same kind of spend; a separate counter would let a plugin alternate surfaces for 8 + 8 |
+| Rate | 8 requests / rolling 60 s per plugin, one counter shared with the plugin host's `agent.complete` brake (`plugin-runtime.ts:678-681`, `:3944-3953`), charged once the request is about to be dispatched | same plugin, same kind of spend; a separate counter would let a plugin alternate surfaces for 8 + 8, and a call refused before it left the host spends nothing |
 | In-flight | 4 per plugin | bounds a fan-out without serializing normal use |
-| Per-call budget | 60 s default, `timeoutMs` up to 300 s | a provider call is bounded; the caller may ask for more |
+| Per-call budget | 60 s default, `timeoutMs` up to 300 s, measured from the moment main accepts the call, pre-flight included | a provider call is bounded; the caller may ask for more, and a budget that covered only the fetch would let provider resolution and an upload run unbounded |
 | Transport deadline | budget + 15 s slack, passed explicitly | `rpcTimeoutMs` defaults to 130 s and cannot know the caller's budget (`packages/shared/src/rpc-timeouts.ts:54-56`), and `ParentHostProxy.call` takes an override (`parent-host-proxy.ts:93-99`) |
 | Request body, non-multipart | ≤ 1 MiB | JSON, text, or base64 payloads |
 | Multipart body | ≤ 8 files, ≤ 32 MiB per file, ≤ 64 MiB total | mirrors the shipped image-edit tiers (`image-inputs.ts:48-82`, 16 MiB/file and 32 MiB/set) at one step larger, because this API is not image-only |
