@@ -251,8 +251,10 @@ export function createExtensionProviderAccess(
         denied("INVALID_ARGUMENT", "callId is required"),
       );
     }
-    // The in-flight cap is checked first: a call refused for congestion never
-    // reached the provider, so it must not also spend the plugin's allowance.
+    // The in-flight cap is checked first, and the brake is charged by the
+    // transport once the request is about to leave (D8): a call refused for
+    // congestion or for a rejected argument never reached the provider, so it
+    // must not also spend the plugin's allowance.
     const owner = claimed.pluginId;
     if ((inFlight.get(owner) ?? 0) >= MAX_IN_FLIGHT_PER_PLUGIN) {
       return refuse(
@@ -264,27 +266,36 @@ export function createExtensionProviderAccess(
         ),
       );
     }
-    // The brake is charged to the plugin that owns the claimed extension, so a
-    // plugin cannot spend a sibling's allowance by naming its extension.
-    if (!consumeRequestBudget(owner)) {
-      return refuse(
-        sessionId,
-        pluginIds,
-        denied("RATE_LIMITED", "The provider request rate limit was reached"),
-      );
-    }
 
     inFlight.set(owner, (inFlight.get(owner) ?? 0) + 1);
     try {
       // The transport audits its own outcome (one row per call, including the
-      // refusals it decides), so this layer only releases the slot.
-      return await providerRequest.perform(params as Record<string, unknown>, {
-        sessionId,
-        ...(projectPath ? { projectPath } : {}),
-        pluginIds,
-        extensionId,
-        callId,
-      } satisfies ProviderRequestSubject);
+      // refusals it decides), so this layer only releases the slot. Both the
+      // brake and the slot follow the *claimed* extension's plugin — a module of
+      // one plugin can therefore spend a sibling's allowance by naming its
+      // extension, because two contributing plugins share one sidecar process
+      // and cannot be told apart at runtime. That is the recorded
+      // union-of-grants residual (D7), not isolation.
+      return await providerRequest.perform(
+        params as Record<string, unknown>,
+        {
+          sessionId,
+          ...(projectPath ? { projectPath } : {}),
+          pluginIds,
+          pluginId: owner,
+          extensionId,
+          callId,
+        } satisfies ProviderRequestSubject,
+        {
+          charge: () => {
+            if (consumeRequestBudget(owner)) return;
+            throw denied(
+              "RATE_LIMITED",
+              "The provider request rate limit was reached",
+            );
+          },
+        },
+      );
     } finally {
       const remaining = (inFlight.get(owner) ?? 1) - 1;
       if (remaining > 0) inFlight.set(owner, remaining);
@@ -295,10 +306,18 @@ export function createExtensionProviderAccess(
     listProviderModels,
     requestProvider,
     // Aborting is a side channel, not a call the surface reports on: it is
-    // answered by the transport and never audited as a request of its own.
-    abortProviderRequest: (params) => providerRequest.abort(params),
+    // answered by the transport and never audited as a request of its own. The
+    // session id still has to be one main owns, so an id from nowhere cannot
+    // reach a live session's in-flight call.
+    abortProviderRequest: (params) => {
+      const sessionId = sessionIdOf(params);
+      if (!sessionId || !sessionProjects.has(sessionId)) return { ok: false };
+      return providerRequest.abort(params);
+    },
     abortAllProviderRequests: () => {
-      inFlight.clear();
+      // The per-plugin counts are deliberately left alone: every running call
+      // releases its own slot in its `finally`, and clearing them here would let
+      // a call that is still winding down decrement a slot a newer call holds.
       providerRequest.abortAll();
     },
   };

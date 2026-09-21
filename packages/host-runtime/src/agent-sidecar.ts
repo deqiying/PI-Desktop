@@ -662,7 +662,12 @@ export class AgentSidecar {
     this.projectInstructionRoots.clear();
     this.vendorAuthBindings.clear();
     this.closeTransport(new Error("agent sidecar disposed"));
-    this.exitHandlers.clear();
+    // Disposal is an exit too. A consumer that releases what this sidecar left
+    // behind — an open tool call, an in-flight provider request — only learns
+    // about it here, or a crash would be the only path that ever cleans up.
+    // `intentional` keeps it out of the failure reporting; `notifyExit` also
+    // clears the handlers, and it never fires twice.
+    this.notifyExit({ code: null, signal: null, intentional: true });
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
     // Wait for the process to actually leave so quit's settle step is real
     // rather than returning while the sidecar is still tearing down.

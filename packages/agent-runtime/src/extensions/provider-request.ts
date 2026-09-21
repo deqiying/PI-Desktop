@@ -144,6 +144,32 @@ function deadlineFor(timeoutMs: unknown): number {
   return budget + TRANSPORT_SLACK_MS;
 }
 
+/**
+ * The client's own give-up for one call. The transport proxy rejects with a bare
+ * message when its deadline passes, so this surface answers with its own
+ * `TIMEOUT` instead — and sends the abort for the call it is no longer waiting
+ * on, so the provider socket does not outlive the caller (plan D8).
+ */
+function createCallDeadline(
+  callId: string,
+  budgetMs: number,
+  abortCall: (callId: string) => void,
+): { promise: Promise<never>; clear: () => void } {
+  let rejectDeadline: (error: Error) => void = () => undefined;
+  const promise = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject;
+  });
+  const timer = setTimeout(() => {
+    abortCall(callId);
+    rejectDeadline(
+      Object.assign(new Error("The provider request exceeded its budget"), {
+        errorCode: "TIMEOUT",
+      }),
+    );
+  }, budgetMs);
+  return { promise, clear: () => clearTimeout(timer) };
+}
+
 export type ExtensionProviderRequesterOptions = {
   callHost: (
     method: string,
@@ -197,35 +223,34 @@ export function createExtensionProviderRequester(
           ? { timeoutMs: input.timeoutMs }
           : {}),
       };
-      if (!signal) {
-        return (await options.callHost(
-          REQUEST_METHOD,
-          params,
-          deadlineFor(input?.timeoutMs),
-        )) as ExtensionProviderRequestResult;
-      }
-
+      // The host give-up and this surface's own give-up are the same moment: the
+      // caller's budget plus transport slack. Racing them means a stalled host
+      // still answers with a code this surface owns, and the abort goes out
+      // instead of the call silently outliving the caller.
+      const budgetMs = deadlineFor(input?.timeoutMs);
+      const deadline = createCallDeadline(callId, budgetMs, abortCall);
       const onAbort = () => abortCall(callId);
-      signal.addEventListener("abort", onAbort, { once: true });
+      signal?.addEventListener("abort", onAbort, { once: true });
       inFlight.add(callId);
       try {
-        const result = (await options.callHost(
-          REQUEST_METHOD,
-          params,
-          deadlineFor(input?.timeoutMs),
-        )) as ExtensionProviderRequestResult;
+        const result = (await Promise.race([
+          options.callHost(REQUEST_METHOD, params, budgetMs),
+          deadline.promise,
+        ])) as ExtensionProviderRequestResult;
         // An abort that landed after main had already answered — the side
         // channel can be slower than the response — is still the caller's
         // cancellation: a cancelled caller is never handed a result.
-        if (signal.aborted) throw abortedError();
+        if (signal?.aborted) throw abortedError();
         return result;
       } catch (error) {
         // An abort surfaces as the transport's own failure; the caller asked
         // for neither, so it is reported as the abort it was.
-        throw signal.aborted ? abortedError() : asError(error);
+        if (signal?.aborted) throw abortedError();
+        throw asError(error);
       } finally {
+        deadline.clear();
         inFlight.delete(callId);
-        signal.removeEventListener("abort", onAbort);
+        signal?.removeEventListener("abort", onAbort);
       }
     },
 

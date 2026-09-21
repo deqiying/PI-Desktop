@@ -2464,6 +2464,16 @@ Delegation rules:
    */
   private async createExtensionBridge(): Promise<TrustedExtensionBridge> {
     const runtime = this;
+    // The requester is created before the first `await` in this method, because
+    // a disposal that races the bridge setup must still find it: the in-flight
+    // calls it owns have to be abortable when this session's runtime goes away.
+    // The transport deadline stays per call — the caller owns the budget (D8).
+    const providers = createExtensionProviderRequester({
+      callHost: (method, params, timeoutOverrideMs) =>
+        runtime.host.call(method, params, timeoutOverrideMs),
+      sessionId: runtime.sessionId,
+    });
+    runtime.extensionProviderRequester = providers;
     const modelRegistry = await createExtensionModelRegistry({
       // A catalogue priming call runs during session start; it must not hold the
       // first turn for the 130 s default host-proxy deadline, so it gets a short
@@ -2486,16 +2496,6 @@ Delegation rules:
           name: agent.name,
         })),
     });
-    // The requester is created once per session and kept on the runtime: the
-    // in-flight calls it owns must be abortable when this session's runtime is
-    // disposed, and the transport deadline is passed per call because the
-    // caller owns the budget (plan D8).
-    const providers = createExtensionProviderRequester({
-      callHost: (method, params, timeoutOverrideMs) =>
-        runtime.host.call(method, params, timeoutOverrideMs),
-      sessionId: runtime.sessionId,
-    });
-    runtime.extensionProviderRequester = providers;
     return {
       sessionId: this.sessionId,
       cwd: this.projectPath ?? process.cwd(),

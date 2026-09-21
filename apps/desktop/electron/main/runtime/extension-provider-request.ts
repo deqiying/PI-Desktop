@@ -12,6 +12,7 @@
  * already been authorized, and never reads the wire for identity.
  */
 
+import { isAbsolute, relative, resolve } from "node:path";
 import { createContainedFileReader } from "../services/contained-file-reader";
 import type { HostProcess } from "../host-process";
 import { modelIdsMatch, type ProviderPublic } from "@pi-desktop/shared";
@@ -24,7 +25,6 @@ import {
   MULTIPART_TOTAL_MAX_BYTES,
   assembleRequestBody,
   callerHeaders,
-  isRequestMethod,
   requestError,
   requestErrorCode,
   requestMethod,
@@ -32,6 +32,7 @@ import {
   resolveRequestUrl,
 } from "./extension-request-envelope";
 import {
+  type ProviderRequestAuditEntry,
   providerRequestAudit,
   responseResult,
 } from "./extension-request-response";
@@ -43,6 +44,8 @@ export type ProviderRequestSubject = {
   projectPath?: string;
   /** The contributing plugins whose grants the gate accepted, for the audit row. */
   pluginIds: string[];
+  /** The plugin that owns the claimed extension: the brake is charged to it. */
+  pluginId: string;
   /** The claimed extension id; attribution only. */
   extensionId: string;
   callId: string;
@@ -52,6 +55,13 @@ export type ExtensionProviderRequestHandler = {
   perform(
     params: Record<string, unknown>,
     subject: ProviderRequestSubject,
+    /**
+     * `charge` is called once the request is about to leave, never before: a
+     * call this transport refuses on its own (a bad argument, an unavailable
+     * provider, an unreadable upload) never reached the provider, so it must not
+     * spend the plugin's allowance (plan D8).
+     */
+    hooks?: { charge?: () => void },
   ): Promise<ExtensionProviderRequestResult>;
   /** `extensions.providers.abort`: cancel one in-flight call by its id. */
   abort(params: unknown): { ok: boolean };
@@ -86,8 +96,33 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** A `[A-Z0-9_]{1,32}` failure code, or "" when the failure carries none. */
+function codeOf(value: unknown): string {
+  const code = (value as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? code : "";
+}
+
 function abortKey(sessionId: string, callId: string): string {
   return `${sessionId}\u0000${callId}`;
+}
+
+/** True when `target` sits strictly inside `base`; the shipped root rule. */
+function within(base: string, target: string): boolean {
+  const rel = relative(base, target);
+  return !!rel && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * Is `modelId` one of the provider's own models? The row's `defaultModelId` is
+ * accepted too: the catalogue this surface pairs with still advertises it when a
+ * row carries no model list, and a model the extension can read from the host
+ * must not be a model the host then refuses (`@deprecated`, but still projected).
+ */
+function modelIsConfigured(provider: ProviderPublic, modelId: string): boolean {
+  if (provider.models?.some((binding) => modelIdsMatch(binding.id, modelId))) {
+    return true;
+  }
+  return !!provider.defaultModelId && modelIdsMatch(provider.defaultModelId, modelId);
 }
 
 /**
@@ -111,10 +146,10 @@ function transportError(
   if (typeof (error as { errorCode?: unknown } | null)?.errorCode === "string") {
     return error as Error;
   }
-  const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
+  const code = codeOf((error as { cause?: unknown } | null)?.cause);
   return requestError(
     "NETWORK_ERROR",
-    typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code)
+    code
       ? `The provider request failed (${code})`
       : "The provider request failed",
   );
@@ -126,13 +161,34 @@ export function createExtensionProviderRequest(
   const inFlight = new Map<string, AbortController>();
   const fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
 
+  /**
+   * A host round trip. A failure that carries no code is the host not being
+   * there — an unavailable host must reach the extension as a code too, not as a
+   * bare message only a log can explain.
+   */
+  const callHost = async <T>(
+    host: Pick<HostProcess, "call">,
+    method: string,
+    params: unknown,
+  ): Promise<T> => {
+    try {
+      return await host.call<T>(method, params);
+    } catch (error) {
+      if (typeof (error as { errorCode?: unknown } | null)?.errorCode === "string") {
+        throw error;
+      }
+      throw requestError("HOST_UNAVAILABLE", `The ${method} lookup failed`);
+    }
+  };
+
   /** The provider row and the credential, or the code that refuses the call (D5). */
   const resolveProvider = async (
     host: Pick<HostProcess, "call">,
     providerId: string,
     modelId: string,
   ): Promise<{ provider: ProviderPublic; credential?: CredentialHeader }> => {
-    const { provider } = await host.call<{ provider?: ProviderPublic }>(
+    const { provider } = await callHost<{ provider?: ProviderPublic }>(
+      host,
       "providers.get",
       { id: providerId },
     );
@@ -142,10 +198,7 @@ export function createExtensionProviderRequest(
         `provider "${providerId}" is not available`,
       );
     }
-    if (
-      modelId &&
-      !provider.models?.some((binding) => modelIdsMatch(binding.id, modelId))
-    ) {
+    if (modelId && !modelIsConfigured(provider, modelId)) {
       throw requestError(
         "MODEL_NOT_CONFIGURED",
         `model "${modelId}" is not configured on provider "${provider.id}"`,
@@ -160,9 +213,11 @@ export function createExtensionProviderRequest(
       );
     }
     if (provider.authKind === "none") return { provider };
-    const { value } = await host.call<{ value?: string }>("providers.getSecret", {
-      id: provider.id,
-    });
+    const { value } = await callHost<{ value?: string }>(
+      host,
+      "providers.getSecret",
+      { id: provider.id },
+    );
     if (!value) {
       throw requestError(
         "PROVIDER_AUTH_MISSING",
@@ -189,15 +244,26 @@ export function createExtensionProviderRequest(
     return async (refs: string[]) => {
       if (refs.length === 0) return [];
       if (!reader) {
-        const scratch = await host
-          .call<{ path?: string }>("session.getScratchPath", {
-            sessionId: subject.sessionId,
-          })
-          .catch(() => undefined);
+        const scratch = await callHost<{ path?: string }>(
+          host,
+          "session.getScratchPath",
+          { sessionId: subject.sessionId },
+        );
+        const root = typeof scratch?.path === "string" ? scratch.path : "";
+        // Fail closed. Falling back to the app data directory would make every
+        // transcript, log, and provider secret the app stores readable through
+        // `multipart.files`, so an answer that is not the session's own scratch
+        // directory refuses the upload instead of widening the roots.
+        if (!root || !within(resolve(options.dataDir, "scratch"), resolve(root))) {
+          throw requestError(
+            "INVALID_ARGUMENT",
+            "The session scratch directory is not usable",
+          );
+        }
         reader = createContainedFileReader({
           roots: {
             ...(subject.projectPath ? { projectPath: subject.projectPath } : {}),
-            scratchPath: scratch?.path ?? options.dataDir,
+            scratchPath: root,
             dataDir: options.dataDir,
           },
           maxFileBytes: MULTIPART_FILE_MAX_BYTES,
@@ -214,38 +280,55 @@ export function createExtensionProviderRequest(
           },
         });
       }
-      return await reader(refs);
+      try {
+        return await reader(refs);
+      } catch (error) {
+        // The reader codes every failure it decides; anything left is a plain
+        // filesystem error (a locked or unreadable file), which still has to
+        // reach the caller as a code rather than as a bare message.
+        if (typeof (error as { errorCode?: unknown } | null)?.errorCode === "string") {
+          throw error;
+        }
+        const code = codeOf(error);
+        throw requestError(
+          "INVALID_ARGUMENT",
+          code
+            ? `An uploaded file could not be read (${code})`
+            : "An uploaded file could not be read",
+        );
+      }
     };
   };
 
   const perform = async (
     params: Record<string, unknown>,
     subject: ProviderRequestSubject,
+    hooks?: { charge?: () => void },
   ): Promise<ExtensionProviderRequestResult> => {
     const startedAt = Date.now();
-    const audit = (entry: Parameters<typeof providerRequestAudit>[0]): void => {
-      options.audit(providerRequestAudit(entry));
-    };
     // Every call leaves exactly one row, including a call refused before any
-    // I/O — a mistake must be as visible as a failure.
+    // I/O — a mistake must be as visible as a failure. Fields are filled in as
+    // the call learns them, so a refusal still names what it was asked for.
+    const row: ProviderRequestAuditEntry = {
+      ok: false,
+      sessionId: subject.sessionId,
+      pluginIds: subject.pluginIds,
+      pluginId: subject.pluginId,
+      extensionId: subject.extensionId,
+      ts: Date.now(),
+    };
+    const writeRow = (): void => {
+      row.ts = Date.now();
+      options.audit(providerRequestAudit(row));
+    };
     const fail = (error: unknown): never => {
-      const errorCode =
-        typeof (error as { errorCode?: unknown })?.errorCode === "string"
-          ? (error as { errorCode: string }).errorCode
-          : "UNSUPPORTED";
-      audit({
-        ok: false,
-        sessionId: subject.sessionId,
-        pluginIds: subject.pluginIds,
-        ts: Date.now(),
-        errorCode,
-        // The method may be the very thing that was invalid, so it is reported
-        // only when it is one the surface accepts.
-        ...(isRequestMethod(asString(params.method))
-          ? { method: asString(params.method) }
-          : {}),
-        durationMs: Date.now() - startedAt,
-      });
+      row.errorCode = requestErrorCode(error, "INTERNAL");
+      const data = (error as { data?: { status?: unknown; bytes?: unknown } } | null)
+        ?.data;
+      if (typeof data?.status === "number") row.status = data.status;
+      if (typeof data?.bytes === "number") row.responseBytes = data.bytes;
+      row.durationMs = Date.now() - startedAt;
+      writeRow();
       throw error;
     };
 
@@ -254,44 +337,67 @@ export function createExtensionProviderRequest(
       const host = options.getHost();
       if (!host) throw requestError("UNSUPPORTED", "The host is unavailable");
       const providerId = asString(params.providerId);
+      if (providerId) row.providerId = providerId;
       if (!providerId) {
         throw requestError("INVALID_ARGUMENT", "providerId is required");
       }
       const modelId = asString(params.modelId);
+      if (modelId) row.modelId = modelId;
       const method = requestMethod(params.method);
+      row.method = method;
       const timeoutMs = requestTimeoutMs(params.timeoutMs);
       const headers = callerHeaders(params.headers);
-      const { provider, credential } = await resolveProvider(
-        host,
-        providerId,
-        modelId,
-      );
-      const url = resolveRequestUrl(provider.baseUrl, params.path);
-      const body = await assembleRequestBody({
-        body: params.body,
-        method,
-        readFiles: fileReaderFor(host, subject),
-      });
 
-      // Provider-configured headers first, then the caller's under the shared
-      // provider-header caps, then the credential last so it always wins (D5).
-      const composed = mergeProviderHeaders(provider.headers, headers) ?? {};
-      const finalHeaders = new Headers(composed);
-      if (credential) finalHeaders.set(credential.name, credential.value);
-      if (body.contentType) finalHeaders.set("content-type", body.contentType);
-
+      // The budget and the abort registry start here rather than at the fetch:
+      // `timeoutMs` is the wall time the caller allowed for the whole call, and
+      // an abort that lands while main is still resolving the provider or
+      // reading an upload has to be honored instead of outrun (plan D8).
       const controller = new AbortController();
       const key = abortKey(subject.sessionId, subject.callId);
       inFlight.set(key, controller);
       // One mutable record, so the timer and the failure mapping read the same
       // fact: a budget that expired is `TIMEOUT`, anything else that stopped the
-      // fetch early is `ABORTED`.
+      // request early is `ABORTED`.
       const transport = { timedOut: false };
       const timer = setTimeout(() => {
         transport.timedOut = true;
         controller.abort();
       }, timeoutMs);
+      const stopped = (): Error =>
+        transport.timedOut
+          ? requestError("TIMEOUT", "The provider request exceeded its budget")
+          : requestError("ABORTED", "The provider request was aborted");
       try {
+        const { provider, credential } = await resolveProvider(
+          host,
+          providerId,
+          modelId,
+        );
+        row.providerId = provider.id;
+        const url = resolveRequestUrl(provider.baseUrl, params.path);
+        // The final path without its query is the audit anchor (plan D10): the
+        // query can carry a secret, the path is where the call went.
+        row.path = new URL(url).pathname;
+        const body = await assembleRequestBody({
+          body: params.body,
+          method,
+          readFiles: fileReaderFor(host, subject),
+        });
+        // A caller that gave up during pre-flight is answered here: nothing may
+        // be sent after an abort, and a budget that expired covers the whole
+        // call, not only the fetch.
+        if (controller.signal.aborted) throw stopped();
+        // The brake is charged when the request is about to leave, so a refusal
+        // this transport decides never spends the plugin's allowance (D8).
+        hooks?.charge?.();
+
+        // Provider-configured headers first, then the caller's under the shared
+        // provider-header caps, then the credential last so it always wins (D5).
+        const composed = mergeProviderHeaders(provider.headers, headers) ?? {};
+        const finalHeaders = new Headers(composed);
+        if (credential) finalHeaders.set(credential.name, credential.value);
+        if (body.contentType) finalHeaders.set("content-type", body.contentType);
+
         let response: Response;
         try {
           response = await fetchImpl(url, {
@@ -322,18 +428,13 @@ export function createExtensionProviderRequest(
             aborted: !transport.timedOut && controller.signal.aborted,
           });
         }
-        audit({
-          ok: true,
-          sessionId: subject.sessionId,
-          pluginIds: subject.pluginIds,
-          ts: Date.now(),
-          status: result.status,
-          method,
-          durationMs: result.durationMs,
-          // Counts and byte sizes only: never a path, a field value, or a header.
-          ...(body.files !== undefined ? { files: body.files } : {}),
-          bytes: body.bytes,
-        });
+        row.ok = true;
+        row.status = result.status;
+        row.durationMs = result.durationMs;
+        row.requestBytes = body.bytes;
+        row.responseBytes = result.body.bytes;
+        if (body.files !== undefined) row.files = body.files;
+        writeRow();
         return result;
       } finally {
         clearTimeout(timer);

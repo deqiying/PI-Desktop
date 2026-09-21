@@ -164,35 +164,63 @@ export async function responseResult(options: {
   };
 }
 
+/** The fields one audit row may carry; the emitter emits only those provided. */
+export type ProviderRequestAuditEntry = {
+  ok: boolean;
+  sessionId: string;
+  /** The session's contributing grants: what the gate accepted (plan D7). */
+  pluginIds: string[];
+  /** The plugin the brake is charged to — the owner of the claimed extension. */
+  pluginId?: string;
+  /** The claimed extension id; attribution only, never authority (plan D7). */
+  extensionId?: string;
+  ts: number;
+  errorCode?: string;
+  providerId?: string;
+  modelId?: string;
+  method?: string;
+  /** The final request path, without its query (plan D10). */
+  path?: string;
+  status?: number;
+  durationMs?: number;
+  /** Multipart file count. */
+  files?: number;
+  /** The assembled request body, in bytes. */
+  requestBytes?: number;
+  /** The response body the caller received, in bytes. */
+  responseBytes?: number;
+};
+
 /**
  * The audit row for one provider request, or for a gate decision that refused
  * one. One shape with two producers, so a refused call and a failed call are
- * comparable — and neither ever carries a path, a header value, or a field
- * value (plan §12).
+ * comparable — and neither ever carries the query string (it can carry a
+ * secret), a header value, a field value, or a credential (plan §12).
  */
-export function providerRequestAudit(entry: {
-  ok: boolean;
-  sessionId: string;
-  pluginIds: string[];
-  ts: number;
-  errorCode?: string;
-  status?: number;
-  method?: string;
-  durationMs?: number;
-  files?: number;
-  bytes?: number;
-}): Record<string, unknown> {
+export function providerRequestAudit(
+  entry: ProviderRequestAuditEntry,
+): Record<string, unknown> {
   return {
     api: "provider.request",
     ok: entry.ok,
     sessionId: entry.sessionId,
     pluginIds: entry.pluginIds,
+    ...(entry.pluginId ? { pluginId: entry.pluginId } : {}),
+    ...(entry.extensionId ? { extensionId: entry.extensionId } : {}),
     ts: entry.ts,
     ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
+    ...(entry.providerId ? { providerId: entry.providerId } : {}),
+    ...(entry.modelId ? { modelId: entry.modelId } : {}),
     ...(entry.status !== undefined ? { status: entry.status } : {}),
     ...(entry.method ? { method: entry.method } : {}),
+    ...(entry.path ? { path: entry.path } : {}),
     ...(entry.durationMs !== undefined ? { durationMs: entry.durationMs } : {}),
     ...(entry.files !== undefined ? { files: entry.files } : {}),
-    ...(entry.bytes !== undefined ? { bytes: entry.bytes } : {}),
+    ...(entry.requestBytes !== undefined
+      ? { requestBytes: entry.requestBytes }
+      : {}),
+    ...(entry.responseBytes !== undefined
+      ? { responseBytes: entry.responseBytes }
+      : {}),
   };
 }

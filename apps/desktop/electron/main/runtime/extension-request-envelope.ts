@@ -74,8 +74,12 @@ const RESERVED_CALLER_HEADERS: ReadonlySet<string> = new Set([
 
 /** A header key per RFC 7230 `token`. */
 const HEADER_KEY = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-/** A multipart part name goes inside `name="…"`, so quotes are not allowed. */
-const PART_NAME = /^[^\u0000-\u001f\u007f"]+$/;
+/**
+ * A multipart part name goes inside `name="…"`, so quotes are not allowed, and
+ * a path separator is refused too: the name is a label, and a file part's name
+ * is never a path the host resolves.
+ */
+const PART_NAME = /^[^\u0000-\u001f\u007f"\\/]+$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 /** A host-side failure: the caller gets a code, never a bare message. */
@@ -116,26 +120,55 @@ function hasControlCharacter(value: string): boolean {
   return false;
 }
 
+/**
+ * A multipart field value is text a caller may want to send as-is, so a
+ * newline and a tab are legal. A CR or LF cannot forge a part boundary either:
+ * the boundary carries a per-call UUID the caller never sees.
+ */
+function hasFieldControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value.charCodeAt(index);
+    if (char === 0x09 || char === 0x0a || char === 0x0d) continue;
+    if (char < 0x20 || char === 0x7f) return true;
+  }
+  return false;
+}
+
 export function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
 }
 
-/** Percent-decode at most twice; a malformed escape is a rejected path. */
-function decodeBounded(value: string): string {
-  let current = value;
-  for (let pass = 0; pass < 2; pass += 1) {
-    let next: string;
-    try {
-      next = decodeURIComponent(current);
-    } catch {
-      throw invalid("path contains a malformed percent-encoding");
-    }
-    if (next === current) break;
-    current = next;
+/** A rejected path: the caller typed an escape that is not an escape. */
+function decodeStrict(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw invalid("path contains a malformed percent-encoding");
   }
-  return current;
+}
+
+/**
+ * A best-effort decode, for a string that is already known to be well-formed:
+ * an escape no longer decodable is left as it stands rather than refused.
+ */
+function decodeTolerant(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Percent-decode at most twice. The first pass is strict, because a malformed
+ * escape the caller typed is a rejected path; the second only looks for a second
+ * layer of encoding and keeps the first result when there is none — otherwise a
+ * legitimate decoded `%` (`…/100%25`) would make the path unusable.
+ */
+function decodeBounded(value: string): string {
+  return decodeTolerant(decodeStrict(value));
 }
 
 /** True when a decoded path carries a `..` segment. `.` is legal and stays put. */
@@ -151,7 +184,11 @@ function hasParentSegment(decoded: string): boolean {
  * Layer 1 rejects a literal or encoded escape, a scheme, an authority, a
  * fragment, a backslash, control characters, an empty path, and anything over
  * the byte cap. Layer 2 re-checks the **decoded** final pathname against the
- * base prefix, which catches an encoding that survived layer 1.
+ * decoded base prefix, which catches an encoding that survived layer 1.
+ *
+ * Only the path portion is decoded and inspected. The query is the caller's own
+ * data and is passed through untouched: a `..` or an unescaped `%` inside it
+ * cannot escape the base prefix, so it must not refuse the call either.
  *
  * There is no implicit `/v1`: the provider's `baseUrl` is used as configured and
  * the caller's path is appended to it, exactly as specified. A caller that
@@ -172,10 +209,11 @@ export function resolveRequestUrl(baseUrl: unknown, callerPath: unknown): string
   if (callerPath.startsWith("//")) {
     throw invalid("path must not start with a scheme-relative authority");
   }
-  // The query is part of the path the caller owns; the traversal check runs on
-  // the whole decoded string, so an escape hidden behind a query separator
-  // cannot slip through either.
-  const decoded = decodeBounded(callerPath);
+
+  const queryAt = callerPath.indexOf("?");
+  const pathOnly = queryAt === -1 ? callerPath : callerPath.slice(0, queryAt);
+  const query = queryAt === -1 ? "" : callerPath.slice(queryAt + 1);
+  const decoded = decodeBounded(pathOnly);
   if (decoded.includes("\\")) throw invalid("path must not contain a backslash");
   if (hasParentSegment(decoded)) {
     throw invalid("path must not contain a traversal segment");
@@ -198,9 +236,6 @@ export function resolveRequestUrl(baseUrl: unknown, callerPath: unknown): string
     throw requestError("PROVIDER_NOT_FOUND", "The provider base URL is not usable");
   }
 
-  const queryAt = callerPath.indexOf("?");
-  const pathOnly = queryAt === -1 ? callerPath : callerPath.slice(0, queryAt);
-  const query = queryAt === -1 ? "" : callerPath.slice(queryAt + 1);
   const basePath = base.pathname.replace(/\/+$/, "");
   const final = new URL(base.href);
   final.pathname = `${basePath}/${pathOnly.replace(/^\/+/, "")}`;
@@ -209,18 +244,17 @@ export function resolveRequestUrl(baseUrl: unknown, callerPath: unknown): string
   if (final.origin !== base.origin) {
     throw invalid("path must not change the destination origin");
   }
-  let finalPath: string;
-  try {
-    finalPath = decodeURIComponent(final.pathname);
-  } catch {
-    throw invalid("path contains a malformed percent-encoding");
-  }
+  const finalPath = decodeTolerant(final.pathname);
   if (hasParentSegment(finalPath)) {
     throw invalid("path must not contain a traversal segment");
   }
-  // `basePath` is "" for a provider rooted at "/", and every pathname is
-  // root-absolute, so the prefix check is then the origin check alone.
-  if (basePath && !finalPath.startsWith(basePath)) {
+  // Both sides of the prefix assertion are decoded, because the URL parser may
+  // percent-encode either of them: a decoded pathname measured against a raw
+  // base path would refuse every call to `https://host/v1%20beta`.
+  const basePrefix = decodeTolerant(basePath);
+  // The prefix is "" for a provider rooted at "/", and every pathname is
+  // root-absolute, so the check is then the origin check alone.
+  if (basePrefix && !finalPath.startsWith(basePrefix)) {
     throw invalid("path must stay inside the provider base path");
   }
   return final.href;
@@ -367,9 +401,9 @@ function multipartFields(value: unknown): Array<{ name: string; value: string }>
     const record = asRecord(entry);
     const name = partName(record?.name, "field");
     const fieldValue = typeof record?.value === "string" ? record.value : null;
-    if (fieldValue === null || hasControlCharacter(fieldValue)) {
+    if (fieldValue === null || hasFieldControlCharacter(fieldValue)) {
       throw invalid(
-        `multipart field "${name}" must be text without control characters`,
+        `multipart field "${name}" must be text; only tab, CR, and LF are allowed among control characters`,
       );
     }
     const bytes = Buffer.byteLength(fieldValue, "utf8");
@@ -533,9 +567,4 @@ export function requestTimeoutMs(value: unknown): number {
     );
   }
   return value;
-}
-
-/** True when the value is one of the methods this surface accepts. */
-export function isRequestMethod(value: unknown): boolean {
-  return typeof value === "string" && REQUEST_METHODS.has(value);
 }
