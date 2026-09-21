@@ -42,6 +42,10 @@ import {
   type TrustedExtensionUiResponse,
 } from "./types.js";
 import type { ExtensionModelRegistry } from "./provider-access.js";
+import type {
+  ExtensionProviderAccess,
+  ExtensionProviderRequester,
+} from "./provider-request.js";
 
 /** Events the desktop runtime emits in v1 (spec §6). */
 export const TRUSTED_EXTENSION_EVENTS = [
@@ -262,6 +266,12 @@ export interface TrustedExtensionBridge {
    * `ModelRegistry` member as inert (spec 16 §5).
    */
   modelRegistry?: ExtensionModelRegistry;
+  /**
+   * Session-scoped provider request client. The Runner binds it per extension,
+   * because main takes the *claimed* `extensionId` for audit attribution while
+   * gating on state it owns (plan D7).
+   */
+  providers?: ExtensionProviderRequester;
 }
 
 type ToolDefinitionLike = {
@@ -695,6 +705,27 @@ export class TrustedExtensionRunner {
     return registry;
   }
 
+  /**
+   * Bind the session's provider requester to one extension. A host that wires
+   * no requester (a headless host, plan §5.4 `UNSUPPORTED`) answers with a
+   * rejection instead of an absent member, so an extension's `await` fails
+   * with a code rather than `undefined is not a function`.
+   */
+  private providerContext(extension: LoadedExtension): ExtensionProviderAccess {
+    const requester = this.bridge.providers;
+    return {
+      request: async (input) => {
+        if (!requester) {
+          throw Object.assign(
+            new Error("provider requests are not available in this host"),
+            { errorCode: "UNSUPPORTED" },
+          );
+        }
+        return requester.request(extension.spec.id, input);
+      },
+    };
+  }
+
   private exec(
     command: string,
     args: string[],
@@ -788,6 +819,9 @@ export class TrustedExtensionRunner {
         getCwd: () => bridge.cwd,
       },
       modelRegistry: this.modelRegistryContext(extension),
+      // PI-specific sibling of the pi member set (plan §5.1): the execution
+      // surface, protocol-agnostic by design.
+      providers: this.providerContext(extension),
       get model() {
         return bridge.getModel();
       },

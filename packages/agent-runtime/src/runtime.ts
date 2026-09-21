@@ -59,6 +59,10 @@ import {
   type TrustedExtensionBridge,
 } from "./extensions/runner.js";
 import { createExtensionModelRegistry } from "./extensions/provider-access.js";
+import {
+  createExtensionProviderRequester,
+  type ExtensionProviderRequester,
+} from "./extensions/provider-request.js";
 import type {
   AgentActivity,
   AgentActivityAgent,
@@ -1499,6 +1503,12 @@ export class DesktopAgentRuntime {
   private pluginSkills: PluginSkillDef[];
   private trustedExtensionSpecs: TrustedExtensionSpec[];
   private extensionRunner?: TrustedExtensionRunner;
+  /**
+   * Session-scoped provider request client, kept so `dispose()` can abort the
+   * calls it still has outstanding (plan D8): a request that outlives its
+   * Runner must not keep a socket alive for a session that is gone.
+   */
+  private extensionProviderRequester?: ExtensionProviderRequester;
   private extensionSessionName?: string;
   private extensionTurnIndex = 0;
   /** Headers an extension edited in `before_provider_headers` for the current turn. */
@@ -2476,12 +2486,23 @@ Delegation rules:
           name: agent.name,
         })),
     });
+    // The requester is created once per session and kept on the runtime: the
+    // in-flight calls it owns must be abortable when this session's runtime is
+    // disposed, and the transport deadline is passed per call because the
+    // caller owns the budget (plan D8).
+    const providers = createExtensionProviderRequester({
+      callHost: (method, params, timeoutOverrideMs) =>
+        runtime.host.call(method, params, timeoutOverrideMs),
+      sessionId: runtime.sessionId,
+    });
+    runtime.extensionProviderRequester = providers;
     return {
       sessionId: this.sessionId,
       cwd: this.projectPath ?? process.cwd(),
       getModel: () => runtime.model,
       setModel: (model) => runtime.setExtensionModel(model),
       modelRegistry,
+      providers,
       getThinkingLevel: () => agentThinkingLevel(runtime.thinkingLevel),
       setThinkingLevel: (level) => {
         runtime.thinkingLevel = clampThinkingLevel(runtime.provider, level as ThinkingLevel);
@@ -7850,6 +7871,11 @@ Delegation rules:
     const runner = this.extensionRunner;
     this.extensionRunner = undefined;
     if (runner) await runner.dispose().catch(() => undefined);
+    // An outstanding provider request belongs to this session: abort it before
+    // the runtime is gone, so its result is discarded rather than delivered to
+    // a session whose runtime was replaced (plan D8).
+    this.extensionProviderRequester?.dispose();
+    this.extensionProviderRequester = undefined;
     this.streamSink.dispose();
     this.disposed = true;
     this.acceptingSteering = false;

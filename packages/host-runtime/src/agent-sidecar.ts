@@ -74,6 +74,11 @@ const HOST_PROXY_ALLOWED = new Set([
   // S1: read-only ready-model catalogue. The subject is resolved in main from
   // the session it owns; the wire carries only `sessionId` (plan D7).
   "extensions.providers.list",
+  // S2: the request surface and its cancellation side channel (plan D3, D8).
+  // Answered by the embedding host, which owns the provider rows, the
+  // credential, and the destination origin.
+  "extensions.providers.request",
+  "extensions.providers.abort",
   "session.rename",
   "session.create",
   "session.fork",
@@ -92,6 +97,10 @@ export type TrustedExtensionSidecarBridge = {
   queuePrioritize: (params: Record<string, unknown>) => Promise<unknown>;
   /** Ready-model catalogue rows for the session this sidecar serves (S1). */
   listProviderModels: (params: Record<string, unknown>) => Promise<unknown>;
+  /** One provider request, gated and audited by the embedding host (S2). */
+  requestProvider: (params: Record<string, unknown>) => Promise<unknown>;
+  /** Cancel an in-flight request by its `(sessionId, callId)` (S2). */
+  abortProviderRequest: (params: Record<string, unknown>) => unknown;
 };
 
 /** The host-core transport as the sidecar proxy sees it. `HostProcess` satisfies it. */
@@ -532,6 +541,8 @@ export class AgentSidecar {
           // An explicit case is mandatory: the fallthrough below is
           // `requestUi`, which would answer an unknown `extensions.*` name.
           else if (method === "extensions.providers.list") result = await bridge.listProviderModels(params);
+          else if (method === "extensions.providers.request") result = await bridge.requestProvider(params);
+          else if (method === "extensions.providers.abort") result = bridge.abortProviderRequest(params);
           else if (method === "session.queuePush") result = await bridge.queuePush(params);
           else if (method === "session.queuePrioritize") result = await bridge.queuePrioritize(params);
           else result = await bridge.requestUi(params);

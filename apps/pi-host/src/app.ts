@@ -187,6 +187,16 @@ export async function startPiHost(config: PiHostConfig, options: { log?: HostLog
       listProviderModels: async () => {
         throw new Error("extension model catalogue is not available on a headless host");
       },
+      // The headless host has no provider transport either: a request fails
+      // closed with `UNSUPPORTED` rather than reaching a host that cannot
+      // honour the credential and destination policy (plan §5.4).
+      requestProvider: async () => {
+        throw Object.assign(
+          new Error("provider requests are not available on a headless host"),
+          { errorCode: "UNSUPPORTED" },
+        );
+      },
+      abortProviderRequest: () => ({ ok: false }),
       queuePush: async (params) =>
         agentHost.startTurn({ subject: "extension", roles: ["controller"] }, {
           sessionId: String(params.sessionId ?? ""),

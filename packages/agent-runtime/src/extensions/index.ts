@@ -21,3 +21,15 @@ export {
   type ExtensionProviderAuthStatus,
   type HostModelDescriptor,
 } from "./provider-access.js";
+export {
+  createExtensionProviderRequester,
+  PROVIDER_REQUEST_DEFAULT_TIMEOUT_MS,
+  PROVIDER_REQUEST_MAX_TIMEOUT_MS,
+  type ExtensionProviderAccess,
+  type ExtensionProviderRequestBody,
+  type ExtensionProviderRequestInput,
+  type ExtensionProviderRequestMethod,
+  type ExtensionProviderRequestResult,
+  type ExtensionProviderRequester,
+  type ExtensionProviderRequesterOptions,
+} from "./provider-request.js";

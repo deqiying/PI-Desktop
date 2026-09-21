@@ -44,6 +44,8 @@ it("routes extensions.providers.list to the bridge handler without falling throu
     .fn()
     .mockResolvedValue({ models: [{ providerId: "p", modelId: "m" }] });
   const requestUi = vi.fn().mockResolvedValue({ kind: "confirm" });
+  const requestProvider = vi.fn().mockResolvedValue({ status: 200, ok: true });
+  const abortProviderRequest = vi.fn().mockReturnValue({ ok: true });
   sidecar.setTrustedExtensionBridge({
     publishCommands: () => {},
     publishDiagnostics: () => {},
@@ -52,6 +54,8 @@ it("routes extensions.providers.list to the bridge handler without falling throu
     queuePush: async () => ({ ok: true }),
     queuePrioritize: async () => ({ ok: true }),
     listProviderModels,
+    requestProvider,
+    abortProviderRequest,
   });
 
   await expect(
@@ -64,7 +68,57 @@ it("routes extensions.providers.list to the bridge handler without falling throu
 
 it("refuses a host-proxy method outside HOST_PROXY_ALLOWED", async () => {
   const { probe } = harness();
+  // `providers.delete` has no allowlist entry: a method the sidecar may not
+  // reach must be refused, and the S2 request surface being allowed must not
+  // widen anything else.
   await expect(
-    probe("extensions.providers.request", { sessionId: "session-one" }),
+    probe("providers.delete", { id: "provider-one" }),
   ).rejects.toMatchObject({ code: -32601 });
+});
+
+it("routes extensions.providers.request and .abort to the bridge handlers", async () => {
+  const { sidecar, probe } = harness();
+  const requestProvider = vi
+    .fn()
+    .mockResolvedValue({ status: 302, ok: false, location: "/elsewhere" });
+  const abortProviderRequest = vi.fn().mockReturnValue({ ok: true });
+  const requestUi = vi.fn().mockResolvedValue({ kind: "confirm" });
+  sidecar.setTrustedExtensionBridge({
+    publishCommands: () => {},
+    publishDiagnostics: () => {},
+    requestUi,
+    configureModel: async () => ({ ok: true }),
+    queuePush: async () => ({ ok: true }),
+    queuePrioritize: async () => ({ ok: true }),
+    listProviderModels: async () => ({ models: [] }),
+    requestProvider,
+    abortProviderRequest,
+  });
+
+  const params = {
+    sessionId: "session-one",
+    extensionId: "ext-one",
+    callId: "call-one",
+    providerId: "provider-one",
+    path: "/models",
+  };
+  await expect(probe("extensions.providers.request", params)).resolves.toEqual({
+    status: 302,
+    ok: false,
+    location: "/elsewhere",
+  });
+  expect(requestProvider).toHaveBeenCalledWith(params);
+  // The abort side channel is answered synchronously and is not a request of
+  // its own, so it must not fall through to `requestUi` either.
+  await expect(
+    probe("extensions.providers.abort", {
+      sessionId: "session-one",
+      callId: "call-one",
+    }),
+  ).resolves.toEqual({ ok: true });
+  expect(abortProviderRequest).toHaveBeenCalledWith({
+    sessionId: "session-one",
+    callId: "call-one",
+  });
+  expect(requestUi).not.toHaveBeenCalled();
 });
