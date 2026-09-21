@@ -181,6 +181,12 @@ export async function startPiHost(config: PiHostConfig, options: { log?: HostLog
       configureModel: async () => {
         throw new Error("extension model configuration is not available on a headless host");
       },
+      // The headless host does not serve the extension catalogue (plan §5.4
+      // lists `UNSUPPORTED` for exactly this case), so the call fails closed
+      // instead of answering with an empty model set.
+      listProviderModels: async () => {
+        throw new Error("extension model catalogue is not available on a headless host");
+      },
       queuePush: async (params) =>
         agentHost.startTurn({ subject: "extension", roles: ["controller"] }, {
           sessionId: String(params.sessionId ?? ""),

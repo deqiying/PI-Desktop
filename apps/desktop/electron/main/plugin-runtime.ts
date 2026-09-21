@@ -1417,6 +1417,15 @@ export class PluginRuntime {
     return [...this.agentExtensions.values()].sort((a, b) => a.id.localeCompare(b.id));
   }
 
+  /**
+   * Whether a loaded plugin holds a permission. The extension provider-access
+   * gate reads grants live rather than at install time, so revoking a
+   * permission takes effect on the next call (plan D7).
+   */
+  pluginHasPermission(pluginId: string, permission: string): boolean {
+    return this.loaded.get(pluginId)?.permissions.has(permission) === true;
+  }
+
   /** Catalog of active plugin skills, ordered by id for a stable prompt. */
   getSkills(): RegisteredPluginSkill[] {
     return [...this.skills.values()].sort((a, b) => a.id.localeCompare(b.id));

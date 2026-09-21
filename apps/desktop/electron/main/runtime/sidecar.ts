@@ -22,6 +22,8 @@ import type { PluginRuntime } from "../plugin-runtime";
 import type { UserMcpRuntime } from "../user-mcp";
 import type { RuntimeState } from "./context";
 import type { FinishTurn } from "./plans";
+import { createExtensionModelCatalog } from "./extension-model-catalog";
+import { createExtensionProviderAccess } from "./extension-provider-access";
 
 export type SidecarRuntimeDependencies = {
   runtimeState: RuntimeState;
@@ -91,6 +93,25 @@ export function createSidecarRuntime({
   wireSidecar: (sidecar: AgentSidecar) => void;
   startSidecar: () => Promise<void>;
 } {
+  // Trusted-extension provider access (plan S1). Main owns the catalogue and
+  // the credentials; the sidecar only receives the redacted ready-model rows,
+  // and only for a session whose contributing plugins hold `models.list` (D7).
+  const extensionProviderAccess = createExtensionProviderAccess({
+    catalog: createExtensionModelCatalog({
+      getHost: () => runtimeState.host,
+      modelsDevCatalog,
+    }),
+    getHost: () => runtimeState.host,
+    activeInProject: pluginActiveInProject,
+    audit: (entry) => {
+      logger.app("plugin", "info", "plugin.api", entry);
+    },
+    plugins: {
+      getAgentExtensions: () => plugins.getAgentExtensions(),
+      pluginHasPermission: (pluginId, permission) =>
+        plugins.pluginHasPermission(pluginId, permission),
+    },
+  });
   const emitAgentEvent = (envelope: AgentEventEnvelope) => {
     // A terminal event for a turn that no longer owns its session must not clear
     // the current turn's state in Agent Host or the renderer. Persistence is a
@@ -393,6 +414,9 @@ export function createSidecarRuntime({
       await runtimeState.agentHostBridge.queue.prioritize(String(params.id ?? ""));
       return { ok: true };
     },
+    // S1: the ready-model catalogue. The grant gate and the audit line live in
+    // the provider-access layer; the wire carries only `sessionId`.
+    listProviderModels: (params) => extensionProviderAccess.listProviderModels(params),
   });
   s.setVendorAuthResolver(async ({ providerId }) =>
     vendorOAuth.resolveAuth(providerId),

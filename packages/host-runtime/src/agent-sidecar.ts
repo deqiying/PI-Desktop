@@ -71,6 +71,9 @@ const HOST_PROXY_ALLOWED = new Set([
   "extensions.ui.request",
   "extensions.diagnostics.publish",
   "extensions.model.configure",
+  // S1: read-only ready-model catalogue. The subject is resolved in main from
+  // the session it owns; the wire carries only `sessionId` (plan D7).
+  "extensions.providers.list",
   "session.rename",
   "session.create",
   "session.fork",
@@ -87,6 +90,8 @@ export type TrustedExtensionSidecarBridge = {
   /** `sendUserMessage`: the Host-owned queue drains it (D386); host-core alone would only store it. */
   queuePush: (params: Record<string, unknown>) => Promise<unknown>;
   queuePrioritize: (params: Record<string, unknown>) => Promise<unknown>;
+  /** Ready-model catalogue rows for the session this sidecar serves (S1). */
+  listProviderModels: (params: Record<string, unknown>) => Promise<unknown>;
 };
 
 /** The host-core transport as the sidecar proxy sees it. `HostProcess` satisfies it. */
@@ -524,6 +529,9 @@ export class AgentSidecar {
           if (method === "extensions.commands.publish") bridge.publishCommands(params);
           else if (method === "extensions.diagnostics.publish") bridge.publishDiagnostics(params);
           else if (method === "extensions.model.configure") result = await bridge.configureModel(params);
+          // An explicit case is mandatory: the fallthrough below is
+          // `requestUi`, which would answer an unknown `extensions.*` name.
+          else if (method === "extensions.providers.list") result = await bridge.listProviderModels(params);
           else if (method === "session.queuePush") result = await bridge.queuePush(params);
           else if (method === "session.queuePrioritize") result = await bridge.queuePrioritize(params);
           else result = await bridge.requestUi(params);
