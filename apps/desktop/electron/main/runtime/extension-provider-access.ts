@@ -6,8 +6,11 @@
  * one of the plugins contributing extensions to that session holds
  * `models.list`.
  *
- * The subject is resolved from state main owns — the session record plus the
- * loaded-plugin registry — never from the wire, which carries only `sessionId`.
+ * The subject is resolved from state main owns — the session→project map main
+ * populated at launch plus the loaded-plugin registry — never from the wire,
+ * which carries only `sessionId`. An id absent from that map is refused without
+ * a catalogue read, so a module cannot name another session's id to borrow its
+ * project grant, and an unknown id cannot degrade to "global plugins apply".
  * Two plugins contributing to one session cannot be told apart at runtime
  * (their modules share one process), so the gate is the union of their grants;
  * that residual limit is recorded in the plan (D7).
@@ -37,6 +40,11 @@ export type ExtensionProviderAccessOptions = {
     getAgentExtensions(): Array<{ pluginId: string; id: string }>;
     pluginHasPermission(pluginId: string, permission: string): boolean;
   };
+  /**
+   * The project each live session owns, as main recorded it at launch. The wire
+   * names a session id; only an id in this map has a known project.
+   */
+  sessionProjects: Map<string, string | null>;
 };
 
 /** A session id is the only identity the wire carries; an empty one is refused. */
@@ -49,41 +57,45 @@ function sessionIdOf(params: unknown): string {
 export function createExtensionProviderAccess(
   options: ExtensionProviderAccessOptions,
 ): ExtensionProviderAccess {
-  const { catalog, getHost, activeInProject, audit, plugins } = options;
+  const { catalog, getHost, activeInProject, audit, plugins, sessionProjects } =
+    options;
+
+  /** One denial row, attributed to whatever identity the call could carry. */
+  const deny = (
+    sessionId: string,
+    pluginIds: string[],
+  ): { models: HostModelDescriptor[] } => {
+    audit({
+      api: AUDIT_API,
+      ok: false,
+      errorCode: "PERMISSION_DENIED",
+      count: 0,
+      sessionId,
+      pluginIds,
+      ts: Date.now(),
+    });
+    return { models: [] };
+  };
 
   const listProviderModels = async (
     params: unknown,
   ): Promise<{ models: HostModelDescriptor[] }> => {
-    const denied = (): { models: HostModelDescriptor[] } => {
-      audit({
-        api: AUDIT_API,
-        ok: false,
-        errorCode: "PERMISSION_DENIED",
-        count: 0,
-        ts: Date.now(),
-      });
-      return { models: [] };
-    };
     const sessionId = sessionIdOf(params);
     const host = getHost();
-    // Without a live host or a session to attribute the call to there is no
-    // subject to check, so the answer is a denial rather than an empty success.
-    if (!host || !sessionId) return denied();
-
-    let projectPath: string | null = null;
-    try {
-      const result = await host.call<{
-        session?: { projectPath?: string } | null;
-      }>("session.get", { id: sessionId });
-      projectPath = result?.session?.projectPath?.trim() || null;
-    } catch {
-      // An unresolvable session keeps the project filter at its strictest:
-      // project-scoped plugins stay out, global ones are unaffected.
-      projectPath = null;
+    // `sessionId` is wire input. Without a live host, or without a session main
+    // actually owns, there is no subject to check: the answer is a denial, not
+    // an empty success, and no catalogue read happens.
+    if (!host || !sessionId || !sessionProjects.has(sessionId)) {
+      return deny(sessionId, []);
     }
+
+    const projectPath = sessionProjects.get(sessionId) ?? null;
     const contributing = plugins
       .getAgentExtensions()
       .filter((extension) => activeInProject(extension.pluginId, projectPath));
+    const pluginIds = [
+      ...new Set(contributing.map((extension) => extension.pluginId)),
+    ];
     if (
       !contributing.some((extension) =>
         plugins.pluginHasPermission(
@@ -92,13 +104,36 @@ export function createExtensionProviderAccess(
         ),
       )
     ) {
-      return denied();
+      return deny(sessionId, pluginIds);
     }
 
     // A catalogue failure rejects the call instead of answering "no models":
     // an unreachable host and a host with no ready models must not look alike.
-    const models = await catalog.listReadyModels();
-    audit({ api: AUDIT_API, ok: true, count: models.length, ts: Date.now() });
+    // The rejected call is still audited, so a granted-then-failed call leaves
+    // a trace.
+    let models: HostModelDescriptor[];
+    try {
+      models = await catalog.listReadyModels();
+    } catch (error) {
+      audit({
+        api: AUDIT_API,
+        ok: false,
+        errorCode: "UNSUPPORTED",
+        count: 0,
+        sessionId,
+        pluginIds,
+        ts: Date.now(),
+      });
+      throw error;
+    }
+    audit({
+      api: AUDIT_API,
+      ok: true,
+      count: models.length,
+      sessionId,
+      pluginIds,
+      ts: Date.now(),
+    });
     return { models };
   };
 

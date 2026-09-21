@@ -103,6 +103,9 @@ export function createSidecarRuntime({
     }),
     getHost: () => runtimeState.host,
     activeInProject: pluginActiveInProject,
+    // The project each session owns comes from main-owned state, never from the
+    // wire: a caller cannot borrow another session's project grant by naming it.
+    sessionProjects,
     audit: (entry) => {
       logger.app("plugin", "info", "plugin.api", entry);
     },

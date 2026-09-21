@@ -105,6 +105,13 @@ export type ExtensionModelRegistryOptions = {
    * and can change during the session.
    */
   extraModels: () => Model<Api>[];
+  /**
+   * The display names of the plugin-registered agent providers. Read lazily for
+   * the same reason as `extraModels` — the Runner that owns them is created
+   * after this registry — so `getProviderDisplayName` keeps answering with the
+   * plugin agent's name instead of the raw `agent-extension:<key>` id.
+   */
+  extraProviderNames: () => Array<{ providerId: string; name: string }>;
 };
 
 /** The request a refresh re-issues; also the key it reports a failure under. */
@@ -149,7 +156,9 @@ function modelFromDescriptor(descriptor: HostModelDescriptor): Model<Api> {
   const cost = descriptor.cost ?? ZERO_COST;
   return {
     id: descriptor.modelId,
-    name: descriptor.label,
+    // A user-assigned model alias is the display name; the catalogue label is
+    // the fallback when the binding carries none.
+    name: descriptor.alias?.trim() || descriptor.label,
     api,
     provider: descriptor.providerId,
     baseUrl: descriptor.baseUrl,
@@ -183,6 +192,12 @@ function abortSignalOf(options: unknown): AbortSignal | undefined {
   return signal instanceof AbortSignal ? signal : undefined;
 }
 
+/** The snapshot and the models it projects, installed together. */
+type CatalogueSnapshot = {
+  descriptors: HostModelDescriptor[];
+  models: Model<Api>[];
+};
+
 /**
  * Prime a Runner-scoped registry from main's catalogue.
  *
@@ -197,17 +212,21 @@ export async function createExtensionModelRegistry(
   let descriptors: HostModelDescriptor[] = [];
   let catalogueModels: Model<Api>[] = [];
 
-  const fetchCatalogue = async (): Promise<void> => {
+  const fetchCatalogue = async (): Promise<CatalogueSnapshot> => {
     const result = await options.callHost(CATALOGUE_METHOD, {
       sessionId: options.sessionId,
     });
     const rows = descriptorRows(result);
-    descriptors = rows;
-    catalogueModels = rows.map(modelFromDescriptor);
+    return { descriptors: rows, models: rows.map(modelFromDescriptor) };
+  };
+
+  const installCatalogue = (snapshot: CatalogueSnapshot): void => {
+    descriptors = snapshot.descriptors;
+    catalogueModels = snapshot.models;
   };
 
   try {
-    await fetchCatalogue();
+    installCatalogue(await fetchCatalogue());
   } catch (error) {
     // A refused or unavailable catalogue is an answer, not a load failure: the
     // registry degrades to the plugin-registered models. It is reported once so
@@ -231,27 +250,62 @@ export async function createExtensionModelRegistry(
     return [...byKey.values()];
   };
 
+  /**
+   * A plugin-registered agent provider needs no host credential: the plugin
+   * owns its transport, so it is "configured" as soon as it is registered. The
+   * session model is part of `extraModels()` too, matching the pre-catalogue
+   * two-source answer.
+   */
+  const pluginOwnedProviders = (): Set<string> =>
+    new Set(options.extraModels().map((model) => model.provider));
+
   const descriptorForProvider = (
     providerId: string,
   ): HostModelDescriptor | undefined =>
     descriptors.find((row) => row.providerId === providerId);
+
+  /**
+   * Plugin-owned providers answer `source: "runtime"` — the upstream union's
+   * value for a provider the runtime supplies — and win over a catalogue row. A
+   * host row with `authKind === "none"` needs no credential at all, so `source`
+   * is omitted there and a caller can tell "no credential needed" from "a key is
+   * stored".
+   */
+  const authStatusForProvider = (
+    providerId: string,
+  ): ExtensionProviderAuthStatus => {
+    if (pluginOwnedProviders().has(providerId)) {
+      return { configured: true, source: "runtime" };
+    }
+    const row = descriptorForProvider(providerId);
+    if (!hasConfiguredAuthRow(row)) return { configured: false };
+    return row?.authKind === "none"
+      ? { configured: true }
+      : { configured: true, source: "stored" };
+  };
 
   const refresh = async (
     refreshOptions?: unknown,
   ): Promise<ExtensionModelRefreshResult> => {
     const signal = abortSignalOf(refreshOptions);
     if (signal?.aborted) return { aborted: true, errors: new Map() };
+    let snapshot: CatalogueSnapshot;
     try {
-      await fetchCatalogue();
+      snapshot = await fetchCatalogue();
     } catch (error) {
       // A failed refresh keeps the previous snapshot; it never empties the
-      // registry. Never throws: the extension gets the failure as data.
+      // registry. Never throws: the extension gets the failure as data, except
+      // that an abort is reported as the abort, not as the failure it caused.
+      if (signal?.aborted) return { aborted: true, errors: new Map() };
       return {
         aborted: false,
         errors: new Map([[CATALOGUE_METHOD, asError(error)]]),
       };
     }
+    // An abort during the fetch discards the result: a caller that cancelled
+    // must not be handed a snapshot it no longer asked for.
     if (signal?.aborted) return { aborted: true, errors: new Map() };
+    installCatalogue(snapshot);
     return { aborted: false, errors: new Map() };
   };
 
@@ -263,19 +317,22 @@ export async function createExtensionModelRegistry(
         (model) => model.provider === providerId && model.id === modelId,
       ),
     getProviderDisplayName: (providerId: string) =>
-      descriptorForProvider(providerId)?.providerName ?? providerId,
+      options
+        .extraProviderNames()
+        .find((entry) => entry.providerId === providerId)?.name ??
+      descriptorForProvider(providerId)?.providerName ??
+      providerId,
     // Truthful availability without key material: `source: "stored"` states
     // that the credential lives in the host, never what it is.
-    getProviderAuthStatus: (providerId: string): ExtensionProviderAuthStatus =>
-      hasConfiguredAuthRow(descriptorForProvider(providerId))
-        ? { configured: true, source: "stored" }
-        : { configured: false },
-    hasConfiguredAuth: (model: Model<Api>) =>
-      hasConfiguredAuthRow(
+    getProviderAuthStatus: authStatusForProvider,
+    hasConfiguredAuth: (model: Model<Api>) => {
+      if (pluginOwnedProviders().has(model?.provider)) return true;
+      return hasConfiguredAuthRow(
         descriptors.find(
           (row) => row.providerId === model?.provider && row.modelId === model?.id,
         ),
-      ),
+      );
+    },
     refresh,
   };
 }

@@ -56,12 +56,14 @@ function hostCall(rows: () => HostModelDescriptor[], methods: string[] = []) {
 async function registryWith(
   rows: () => HostModelDescriptor[],
   extra: Model<Api>[] = [],
+  extraProviderNames: Array<{ providerId: string; name: string }> = [],
 ): Promise<{ registry: ExtensionModelRegistry; methods: string[] }> {
   const methods: string[] = [];
   const registry = await createExtensionModelRegistry({
     callHost: hostCall(rows, methods),
     sessionId: "session-one",
     extraModels: () => extra,
+    extraProviderNames: () => extraProviderNames,
   });
   return { registry, methods };
 }
@@ -140,6 +142,15 @@ describe("createExtensionModelRegistry", () => {
     expect(registry.getProviderDisplayName("unknown-provider")).toBe("unknown-provider");
   });
 
+  it("projects a model alias into the display name and falls back to the label", async () => {
+    const { registry } = await registryWith(() => [
+      descriptor({ alias: "Fast Model" }),
+      descriptor({ modelId: "model-two", label: "model-two (Provider One)", alias: "   " }),
+    ]);
+    expect(registry.find("provider-one", "model-one")?.name).toBe("Fast Model");
+    expect(registry.find("provider-one", "model-two")?.name).toBe("model-two (Provider One)");
+  });
+
   it("reports truthful auth status without key material", async () => {
     const { registry } = await registryWith(() => [
       descriptor({ providerId: "secret" }),
@@ -155,16 +166,15 @@ describe("createExtensionModelRegistry", () => {
       configured: true,
       source: "stored",
     });
-    expect(registry.getProviderAuthStatus("none")).toEqual({
-      configured: true,
-      source: "stored",
-    });
+    // `authKind === "none"` needs no credential, so the source is omitted and a
+    // caller can tell it apart from a provider with a stored key.
+    expect(registry.getProviderAuthStatus("none")).toEqual({ configured: true });
     expect(registry.getProviderAuthStatus("unconfigured")).toEqual({ configured: false });
     expect(registry.getProviderAuthStatus("absent")).toEqual({ configured: false });
     expect(JSON.stringify(registry.getProviderAuthStatus("secret"))).not.toContain("key");
   });
 
-  it("answers hasConfiguredAuth only for a configured catalogue row", async () => {
+  it("answers hasConfiguredAuth for a configured catalogue row and a plugin-owned provider", async () => {
     const { registry } = await registryWith(
       () => [
         descriptor(),
@@ -174,7 +184,24 @@ describe("createExtensionModelRegistry", () => {
     );
     expect(registry.hasConfiguredAuth(model("provider-one", "model-one"))).toBe(true);
     expect(registry.hasConfiguredAuth(model("unconfigured", "model-two"))).toBe(false);
-    expect(registry.hasConfiguredAuth(model("plugin", "agent-model"))).toBe(false);
+    // A plugin-registered agent provider owns its transport, so it needs no host
+    // credential: the pre-catalogue answer was `true` and is restored here.
+    expect(registry.hasConfiguredAuth(model("plugin", "agent-model"))).toBe(true);
+  });
+
+  it("reports a plugin-owned provider as configured with the runtime source and its agent name", async () => {
+    const provider = "agent-extension:commandcode";
+    const { registry } = await registryWith(
+      () => [],
+      [model(provider, "cc-1", "Command Code 1")],
+      [{ providerId: provider, name: "Command Code" }],
+    );
+    expect(registry.getProviderAuthStatus(provider)).toEqual({
+      configured: true,
+      source: "runtime",
+    });
+    expect(registry.getProviderDisplayName(provider)).toBe("Command Code");
+    expect(registry.hasConfiguredAuth(model(provider, "cc-1"))).toBe(true);
   });
 
   it("replaces the snapshot on refresh and never throws", async () => {
@@ -199,6 +226,7 @@ describe("createExtensionModelRegistry", () => {
       },
       sessionId: "session-one",
       extraModels: () => [],
+      extraProviderNames: () => [],
     });
     const failed = await failing.refresh();
     expect(failed.aborted).toBe(false);
@@ -226,11 +254,64 @@ describe("createExtensionModelRegistry", () => {
       },
       sessionId: "session-one",
       extraModels: () => [model("plugin", "agent-model", "Plugin agent")],
+      extraProviderNames: () => [],
     });
     expect(registry.getAll().map((entry) => entry.name)).toEqual(["Plugin agent"]);
     expect(registry.getAvailable()).toEqual(registry.getAll());
     expect(registry.find("plugin", "agent-model")?.name).toBe("Plugin agent");
     expect(registry.getProviderDisplayName("plugin")).toBe("plugin");
-    expect(registry.getProviderAuthStatus("plugin")).toEqual({ configured: false });
+    // A plugin-owned provider is configured through its own transport.
+    expect(registry.getProviderAuthStatus("plugin")).toEqual({
+      configured: true,
+      source: "runtime",
+    });
   });
+  it("discards a refresh aborted during the fetch instead of installing it", async () => {
+    const batches: HostModelDescriptor[][] = [
+      [descriptor()],
+      [descriptor(), descriptor({ modelId: "model-two" })],
+    ];
+    const controller = new AbortController();
+    let call = 0;
+    const registry = await createExtensionModelRegistry({
+      callHost: async () => {
+        const rows = batches[call] ?? [];
+        call += 1;
+        // The caller cancels while the second (refresh) round trip is in flight.
+        if (call > 1) controller.abort();
+        return { models: rows };
+      },
+      sessionId: "session-one",
+      extraModels: () => [],
+      extraProviderNames: () => [],
+    });
+    expect(registry.getAll()).toHaveLength(1);
+
+    const aborted = await registry.refresh({ signal: controller.signal });
+    expect(aborted.aborted).toBe(true);
+    expect([...aborted.errors]).toEqual([]);
+    // The fetched rows are dropped: the snapshot is not installed.
+    expect(registry.getAll()).toHaveLength(1);
+  });
+  it("reports an abort as aborted even when the fetch itself failed", async () => {
+    const controller = new AbortController();
+    let call = 0;
+    const registry = await createExtensionModelRegistry({
+      callHost: async () => {
+        call += 1;
+        if (call === 1) return { models: [descriptor()] };
+        // The abort surfaces as a transport failure; the caller must still see
+        // the abort, not the failure it caused.
+        controller.abort();
+        throw new Error("transport failed");
+      },
+      sessionId: "session-one",
+      extraModels: () => [],
+      extraProviderNames: () => [],
+    });
+    const result = await registry.refresh({ signal: controller.signal });
+    expect(result.aborted).toBe(true);
+    expect([...result.errors]).toEqual([]);
+  });
+
 });

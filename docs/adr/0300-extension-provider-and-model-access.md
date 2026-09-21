@@ -39,7 +39,10 @@ the inert-member rule, and adds the grant that the content requires.
    `refresh()` re-fetches and returns the upstream `{ aborted, errors }` result;
    it never throws. A failed or denied fetch leaves an empty snapshot, and the
    registry still answers with the session model and plugin-registered agent
-   models, so an extension that only uses `registerAgent` keeps working.
+   models, so an extension that only uses `registerAgent` keeps working. A
+   plugin-owned provider keeps the answers it had before this change: its auth
+   status reports configured with `source: "runtime"`, its display name is the
+   plugin agent's name, and `hasConfiguredAuth` returns true for it.
 3. **The projection carries `baseUrl` and capability metadata, never a
    credential.** `baseUrl` is not a secret: the renderer already renders it from
    `ProviderPublic.baseUrl`, and spec 16 §5's exclusion list names keys, secret
@@ -59,7 +62,9 @@ the inert-member rule, and adds the grant that the content requires.
    `(extension, kind, member)`, so repeated calls do not multiply them.
 6. **The catalogue is gated by `models.list`**, evaluated in main from main-owned
    state — the session's loaded extension set, filtered by project activity —
-   never from a wire-supplied identity. Without the grant the registry exposes no
+   never from a wire-supplied identity: a session id main does not own is
+   refused before any catalogue read, so a module cannot name another session's
+   id to borrow its project grant. Without the grant the registry exposes no
    host models. When several plugins contribute extensions to one session the
    rule is the union of their grants, because their modules share one sidecar
    process (spec 16 §4.3); with one contributing plugin the check is exact.

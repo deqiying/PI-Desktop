@@ -114,8 +114,8 @@ const INERT_REGISTRY_NEUTRALS: Record<string, unknown> = {
   getApiKeyForProvider: undefined,
   getProviderAuth: undefined,
   complete: undefined,
-  stream: undefined,
-  streamSimple: undefined,
+  // `stream` / `streamSimple` are checked separately: they are shape-preserving
+  // ended async iterables, not a plain neutral value.
   registerProvider: undefined,
   unregisterProvider: undefined,
   getRegisteredProviderConfig: undefined,
@@ -439,6 +439,25 @@ export default function (pi: any) {
       expect(row, member).toBeDefined();
       expect(row?.type, member).toBe("function");
       expect(row?.threw, member).toBeUndefined();
+      if (member === "stream" || member === "streamSimple") {
+        // Shape-preserving: an ended, empty async iterable so `for await`
+        // yields nothing instead of throwing "not async iterable".
+        const iterable = row?.first;
+        expect(
+          typeof (iterable as AsyncIterable<unknown> | undefined)?.[
+            Symbol.asyncIterator
+          ],
+          member,
+        ).toBe("function");
+        const events: unknown[] = [];
+        if (iterable) {
+          for await (const event of iterable as AsyncIterable<unknown>) {
+            events.push(event);
+          }
+        }
+        expect(events, member).toEqual([]);
+        continue;
+      }
       expect(row?.first, member).toEqual(INERT_REGISTRY_NEUTRALS[member]);
       expect(row?.second, member).toEqual(INERT_REGISTRY_NEUTRALS[member]);
     }

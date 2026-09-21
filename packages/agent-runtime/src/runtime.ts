@@ -303,6 +303,13 @@ const PROVIDER_REQUEST_MAX_RETRIES = 0;
 const MAX_MUTATION_RECOVERY_FAILURES = 3;
 const BASH_PATCH_FAILURE_KEY = "__bash_patch_command__";
 /**
+ * How long a catalogue priming call may hold session start. The catalogue is a
+ * main-local projection, so a few seconds is generous; the 130 s default
+ * host-proxy deadline would otherwise stall the first turn on an unresponsive
+ * host (`packages/shared/src/rpc-timeouts.ts`).
+ */
+const CATALOGUE_PRIME_TIMEOUT_MS = 5_000;
+/**
  * Edit failures the line-anchored contract expects and already answers: each
  * one hands back the live tag, or the content of the lines it refused to write
  * blind (spec 18-line-anchored-edit-contract §9.3). One honest retry is the designed response, so each of
@@ -2347,9 +2354,14 @@ Delegation rules:
    */
   async loadTrustedExtensions(): Promise<void> {
     if (this.disposed || this.extensionRunner || this.trustedExtensionSpecs.length === 0) return;
+    // `createExtensionBridge` suspends on a host round trip, so disposal must be
+    // re-checked before a runner is constructed: otherwise a session torn down
+    // mid-flight leaves a loaded runner (and its modules) alive after teardown.
+    const bridge = await this.createExtensionBridge();
+    if (this.disposed) return;
     const runner = new TrustedExtensionRunner({
       specs: this.trustedExtensionSpecs,
-      bridge: await this.createExtensionBridge(),
+      bridge,
       reservedToolNames: () => this.toolCatalog.keys(),
     });
     this.extensionRunner = runner;
@@ -2443,7 +2455,11 @@ Delegation rules:
   private async createExtensionBridge(): Promise<TrustedExtensionBridge> {
     const runtime = this;
     const modelRegistry = await createExtensionModelRegistry({
-      callHost: (method, params) => runtime.host.call(method, params),
+      // A catalogue priming call runs during session start; it must not hold the
+      // first turn for the 130 s default host-proxy deadline, so it gets a short
+      // call-site override and degrades to an empty snapshot instead.
+      callHost: (method, params) =>
+        runtime.host.call(method, params, CATALOGUE_PRIME_TIMEOUT_MS),
       sessionId: runtime.sessionId,
       // The session model and the agent models this session's extensions
       // registered: both postdate the registry and can change mid-session, so
@@ -2452,6 +2468,13 @@ Delegation rules:
         runtime.model,
         ...(runtime.extensionRunner?.getAgentModels() ?? []),
       ],
+      // Plugin agent provider names postdate the registry too (the runner is
+      // built after the bridge), so display names stay lazy as well.
+      extraProviderNames: () =>
+        (runtime.extensionRunner?.getAgents() ?? []).map((agent) => ({
+          providerId: agent.providerId,
+          name: agent.name,
+        })),
     });
     return {
       sessionId: this.sessionId,

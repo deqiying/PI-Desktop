@@ -30,29 +30,27 @@ function accessFor({
   extensions,
   permissions = {},
   projectPath = null,
+  sessionId = "session-one",
+  // main owns this map; a session id absent from it is refused without a read.
+  sessionProjects = new Map([[sessionId, projectPath]]),
   activeInProject = () => true,
-  session = { session: { projectPath } },
   catalogModels = MODELS,
-  host = null,
+  catalog = null,
 } = {}) {
   const audits = [];
   const calls = [];
   const access = createExtensionProviderAccess({
-    catalog: {
+    catalog: catalog ?? {
       listReadyModels: async () => catalogModels,
     },
-    getHost: () =>
-      host ?? {
-        call: async (method, params) => {
-          calls.push({ method, params });
-          if (method === "session.get") {
-            if (session instanceof Error) throw session;
-            return session;
-          }
-          throw new Error(`unexpected host call ${method}`);
-        },
+    getHost: () => ({
+      call: async (method, params) => {
+        calls.push({ method, params });
+        throw new Error(`unexpected host call ${method}`);
       },
+    }),
     activeInProject,
+    sessionProjects,
     audit: (entry) => audits.push(entry),
     plugins: {
       getAgentExtensions: () => extensions,
@@ -63,7 +61,7 @@ function accessFor({
   return { access, audits, calls };
 }
 
-test("denies without the grant and audits the denial", async () => {
+test("denies without the grant and audits the denial with identity", async () => {
   const { access, audits, calls } = accessFor({
     extensions: [{ id: "extension-a", pluginId: "plugin-a" }],
     permissions: { "plugin-a": ["agent.extension"] },
@@ -72,13 +70,15 @@ test("denies without the grant and audits the denial", async () => {
   assert.deepEqual(await access.listProviderModels({ sessionId: "session-one" }), {
     models: [],
   });
-  assert.deepEqual(calls, [{ method: "session.get", params: { id: "session-one" } }]);
+  assert.deepEqual(calls, []);
   assert.equal(audits.length, 1);
   assert.deepEqual(audits[0], {
     api: "models.list",
     ok: false,
     errorCode: "PERMISSION_DENIED",
     count: 0,
+    sessionId: "session-one",
+    pluginIds: ["plugin-a"],
     ts: audits[0].ts,
   });
   assert.equal(typeof audits[0].ts, "number");
@@ -94,7 +94,14 @@ test("answers the ready catalogue with the grant and audits the row count", asyn
   const result = await access.listProviderModels({ sessionId: "session-one" });
   assert.deepEqual(result, { models: MODELS });
   assert.deepEqual(audits, [
-    { api: "models.list", ok: true, count: 1, ts: audits[0].ts },
+    {
+      api: "models.list",
+      ok: true,
+      count: 1,
+      sessionId: "session-one",
+      pluginIds: ["plugin-a"],
+      ts: audits[0].ts,
+    },
   ]);
 });
 
@@ -137,30 +144,45 @@ test("denies an unidentified caller instead of trusting the wire", async () => {
 
   assert.deepEqual(await access.listProviderModels({}), { models: [] });
   assert.deepEqual(await access.listProviderModels(null), { models: [] });
-  assert.deepEqual(await access.listProviderModels({ sessionId: "  " }), { models: [] });
-  assert.deepEqual(await access.listProviderModels({ sessionId: 42 }), { models: [] });
+  assert.deepEqual(await access.listProviderModels({ sessionId: "  " }), {
+    models: [],
+  });
+  assert.deepEqual(await access.listProviderModels({ sessionId: 42 }), {
+    models: [],
+  });
   // No session was named, so no host call could resolve a subject.
   assert.deepEqual(calls, []);
   assert.equal(audits.length, 4);
   assert.equal(audits.every((entry) => entry.ok === false), true);
+  assert.equal(audits.every((entry) => entry.pluginIds.length === 0), true);
 });
 
-test("keeps the project filter strict when the session cannot be read", async () => {
-  const { access, audits } = accessFor({
+test("denies a session id main does not own without reading the catalogue", async () => {
+  const { access, audits, calls } = accessFor({
     extensions: [{ id: "extension-a", pluginId: "plugin-a" }],
     permissions: { "plugin-a": ["agent.extension", "models.list"] },
-    session: new Error("session not found"),
-    // A project-scoped plugin matches nothing while the session is unresolved,
-    // so a failed session read cannot widen the grant.
-    activeInProject: (_pluginId, projectPath) => projectPath === "/workspace/demo",
+    // main knows only `session-one`, so a sibling's id cannot borrow its grant.
+    sessionProjects: new Map([["session-one", null]]),
   });
-  assert.deepEqual(await access.listProviderModels({ sessionId: "session-one" }), {
-    models: [],
+
+  assert.deepEqual(
+    await access.listProviderModels({ sessionId: "session-borrowed" }),
+    { models: [] },
+  );
+  assert.deepEqual(calls, []);
+  assert.equal(audits.length, 1);
+  assert.deepEqual(audits[0], {
+    api: "models.list",
+    ok: false,
+    errorCode: "PERMISSION_DENIED",
+    count: 0,
+    sessionId: "session-borrowed",
+    pluginIds: [],
+    ts: audits[0].ts,
   });
-  assert.equal(audits[0].errorCode, "PERMISSION_DENIED");
 });
 
-test("rejects when the catalogue itself is unreachable", async () => {
+test("rejects when the catalogue itself is unreachable and leaves a trace", async () => {
   const { access, audits } = accessFor({
     extensions: [{ id: "extension-a", pluginId: "plugin-a" }],
     permissions: { "plugin-a": ["agent.extension", "models.list"] },
@@ -173,11 +195,11 @@ test("rejects when the catalogue itself is unreachable", async () => {
     },
     getHost: () => ({
       call: async (method) => {
-        if (method === "session.get") return { session: { projectPath: null } };
         throw new Error(`unexpected host call ${method}`);
       },
     }),
     activeInProject: () => true,
+    sessionProjects: new Map([["session-one", null]]),
     audit: (entry) => audits.push(entry),
     plugins: {
       getAgentExtensions: () => [{ id: "extension-a", pluginId: "plugin-a" }],
@@ -190,7 +212,19 @@ test("rejects when the catalogue itself is unreachable", async () => {
     () => failing.listProviderModels({ sessionId: "session-one" }),
     /host unavailable/,
   );
-  assert.deepEqual(audits, []);
+  // A granted call that then fails still leaves an audit row.
+  assert.deepEqual(audits, [
+    {
+      api: "models.list",
+      ok: false,
+      errorCode: "UNSUPPORTED",
+      count: 0,
+      sessionId: "session-one",
+      pluginIds: ["plugin-a"],
+      ts: audits[0].ts,
+    },
+  ]);
+  // The same access object still answers once the catalogue recovers.
   assert.deepEqual(await access.listProviderModels({ sessionId: "session-one" }), {
     models: MODELS,
   });

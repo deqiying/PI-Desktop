@@ -176,7 +176,9 @@ main、渲染层或插件宿主进程中。
 `refresh()` 重新拉取快照。PI 未实现的所有上游成员——`getProvider`、`getError`、
 `isUsingOAuth`、`getApiKeyAndHeaders`、`getApiKeyForProvider`、`getProviderAuth`、
 `complete`、`stream`、`streamSimple`，以及注册系列——都存在、返回其文档化的中性值，
-并按扩展、按成员各产生一条诊断（ADR 0300）。
+并按扩展、按成员各产生一条诊断（ADR 0300）。插件自有的 provider 保留其原有答案：
+其认证状态报告为已配置且 `source: "runtime"`，其显示名是插件 agent 的名称，
+且 `hasConfiguredAuth` 对它返回 true。main 不拥有的会话 id 会在任何目录读取之前被拒绝。
 
 ## 6. 事件映射
 

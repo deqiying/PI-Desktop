@@ -302,7 +302,11 @@ project the same ready set. Reads are synchronous from the snapshot, and
 `getProvider`, `getError`, `isUsingOAuth`, `getApiKeyAndHeaders`,
 `getApiKeyForProvider`, `getProviderAuth`, `complete`, `stream`, `streamSimple`,
 and the registration family — exists and returns its documented neutral value
-with one diagnostic per extension per member (ADR 0300).
+with one diagnostic per extension per member (ADR 0300). A plugin-owned provider
+keeps its previous answers: its auth status reports configured with
+`source: "runtime"`, its display name is the plugin agent's name, and
+`hasConfiguredAuth` returns true for it. A session id main does not own is
+refused before any catalogue read.
 
 ## 6. Event mapping
 

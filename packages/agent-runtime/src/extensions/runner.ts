@@ -139,6 +139,17 @@ const INERT_UI_MEMBERS = [
   "getEditorText",
   "addAutocompleteProvider",
 ] as const;
+/**
+ * An ended, empty `AssistantMessageEventStream`. `stream` / `streamSimple`
+ * stay inert, but they must remain shape-preserving: returning `undefined`
+ * makes `for await (const ev of ctx.modelRegistry.stream(...))` throw
+ * `TypeError: not async iterable`, which spec 16 §5 forbids.
+ */
+function emptyAssistantMessageEventStream(): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  stream.end();
+  return stream;
+}
 
 /**
  * `ModelRegistry` members PI does not implement (spec 16 §5). Each one exists,
@@ -156,8 +167,8 @@ const INERT_MODEL_REGISTRY_MEMBERS: ReadonlyArray<{
   { member: "getApiKeyForProvider", neutral: () => Promise.resolve(undefined) },
   { member: "getProviderAuth", neutral: () => Promise.resolve(undefined) },
   { member: "complete", neutral: () => Promise.resolve(undefined) },
-  { member: "stream", neutral: () => undefined },
-  { member: "streamSimple", neutral: () => undefined },
+  { member: "stream", neutral: () => emptyAssistantMessageEventStream() },
+  { member: "streamSimple", neutral: () => emptyAssistantMessageEventStream() },
   { member: "registerProvider", neutral: () => undefined },
   { member: "unregisterProvider", neutral: () => undefined },
   { member: "getRegisteredProviderConfig", neutral: () => undefined },
