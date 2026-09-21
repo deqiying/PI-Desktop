@@ -329,6 +329,7 @@ Each ADR includes:
 | 0298 | [The app ships no fonts](0298-remove-bundled-fonts.md) | Accepted (D598; amends ADR 0083 / D232) |
 | 0299 | [Subagent context budget and delegate compaction](0299-subagent-context-budget.md) | Accepted for implementation (amends ADR 0064; extends ADR 0062 / ADR 0279) |
 | 0300 | [Trusted-extension provider and model access](0300-extension-provider-and-model-access.md) | Accepted for implementation (amends ADR 0258 decision 4) |
+| 0301 | [Trusted-extension provider requests](0301-trusted-extension-provider-requests.md) | Accepted for implementation (amends ADR 0300) |
 | turn-process-and-thinking-display | [Turn process and thinking presentation](turn-process-and-thinking-display.md) | Accepted |
 | provider-display-order | [Provider display order](provider-display-order.md) | Accepted |
 | registry-header-variable-spelling | [Remote header variables accept the registry's `{name}` spelling](registry-header-variable-spelling.md) | Proposed |
