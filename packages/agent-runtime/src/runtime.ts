@@ -58,6 +58,7 @@ import {
   type RegisteredTrustedExtensionAgent,
   type TrustedExtensionBridge,
 } from "./extensions/runner.js";
+import { createExtensionModelRegistry } from "./extensions/provider-access.js";
 import type {
   AgentActivity,
   AgentActivityAgent,
@@ -2348,7 +2349,7 @@ Delegation rules:
     if (this.disposed || this.extensionRunner || this.trustedExtensionSpecs.length === 0) return;
     const runner = new TrustedExtensionRunner({
       specs: this.trustedExtensionSpecs,
-      bridge: this.createExtensionBridge(),
+      bridge: await this.createExtensionBridge(),
       reservedToolNames: () => this.toolCatalog.keys(),
     });
     this.extensionRunner = runner;
@@ -2431,38 +2432,33 @@ Delegation rules:
     return !this.agent.state.isStreaming;
   }
 
-  private extensionModelRegistry(): Record<string, unknown> {
-    const getRunner = () => this.extensionRunner;
-    const models = () => [this.model, ...(getRunner()?.getAgentModels() ?? [])];
-    return {
-      getAll: () => [...new Map(models().map((model) => [`${model.provider}/${model.id}`, model])).values()],
-      getAvailable: () => [...new Map(models().map((model) => [`${model.provider}/${model.id}`, model])).values()],
-      find: (providerId: string, modelId: string) =>
-        models().find((model) => model.provider === providerId && model.id === modelId),
-      getProviderDisplayName: (providerId: string) =>
-        getRunner()?.getAgents().find((agent) => agent.providerId === providerId)?.name ??
-        (providerId === this.provider.id ? this.provider.name : providerId),
-      getProviderAuthStatus: (providerId: string) => ({
-        configured: [this.provider.id, ...(getRunner()?.getAgents().map((agent) => agent.providerId) ?? [])].includes(providerId),
-        source: "plugin",
-      }),
-      hasConfiguredAuth: (model: { provider?: string }) =>
-        typeof model.provider === "string" &&
-        [this.provider.id, ...(getRunner()?.getAgents().map((agent) => agent.providerId) ?? [])].includes(model.provider),
-    };
-  }
-
   getTrustedExtensionReports() {
     return this.extensionRunner?.getLoadReports() ?? [];
   }
-  private createExtensionBridge(): TrustedExtensionBridge {
+  /**
+   * The bridge carries the Runner-scoped catalogue snapshot. Main owns the
+   * catalogue and the credentials, and one Runner serves one session, so the
+   * snapshot is primed here and never kept in module state (plan D2).
+   */
+  private async createExtensionBridge(): Promise<TrustedExtensionBridge> {
     const runtime = this;
+    const modelRegistry = await createExtensionModelRegistry({
+      callHost: (method, params) => runtime.host.call(method, params),
+      sessionId: runtime.sessionId,
+      // The session model and the agent models this session's extensions
+      // registered: both postdate the registry and can change mid-session, so
+      // they are read through a closure on every read.
+      extraModels: () => [
+        runtime.model,
+        ...(runtime.extensionRunner?.getAgentModels() ?? []),
+      ],
+    });
     return {
       sessionId: this.sessionId,
       cwd: this.projectPath ?? process.cwd(),
       getModel: () => runtime.model,
       setModel: (model) => runtime.setExtensionModel(model),
-      modelRegistry: runtime.extensionModelRegistry(),
+      modelRegistry,
       getThinkingLevel: () => agentThinkingLevel(runtime.thinkingLevel),
       setThinkingLevel: (level) => {
         runtime.thinkingLevel = clampThinkingLevel(runtime.provider, level as ThinkingLevel);

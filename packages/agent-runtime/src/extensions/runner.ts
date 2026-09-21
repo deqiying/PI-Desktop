@@ -41,6 +41,7 @@ import {
   type TrustedExtensionUiRequest,
   type TrustedExtensionUiResponse,
 } from "./types.js";
+import type { ExtensionModelRegistry } from "./provider-access.js";
 
 /** Events the desktop runtime emits in v1 (spec §6). */
 export const TRUSTED_EXTENSION_EVENTS = [
@@ -139,6 +140,31 @@ const INERT_UI_MEMBERS = [
   "addAutocompleteProvider",
 ] as const;
 
+/**
+ * `ModelRegistry` members PI does not implement (spec 16 §5). Each one exists,
+ * returns the upstream neutral value, reports one diagnostic per extension per
+ * member, and never throws. The members the host does provide are never wrapped.
+ */
+const INERT_MODEL_REGISTRY_MEMBERS: ReadonlyArray<{
+  member: string;
+  neutral: () => unknown;
+}> = [
+  { member: "getProvider", neutral: () => undefined },
+  { member: "getError", neutral: () => undefined },
+  { member: "isUsingOAuth", neutral: () => false },
+  { member: "getApiKeyAndHeaders", neutral: () => Promise.resolve(undefined) },
+  { member: "getApiKeyForProvider", neutral: () => Promise.resolve(undefined) },
+  { member: "getProviderAuth", neutral: () => Promise.resolve(undefined) },
+  { member: "complete", neutral: () => Promise.resolve(undefined) },
+  { member: "stream", neutral: () => undefined },
+  { member: "streamSimple", neutral: () => undefined },
+  { member: "registerProvider", neutral: () => undefined },
+  { member: "unregisterProvider", neutral: () => undefined },
+  { member: "getRegisteredProviderConfig", neutral: () => undefined },
+  { member: "getRegisteredNativeProvider", neutral: () => undefined },
+  { member: "getRegisteredProviderIds", neutral: () => [] },
+];
+
 export type ExtensionExecOptions = {
   cwd?: string;
   env?: Record<string, string>;
@@ -219,8 +245,12 @@ export interface TrustedExtensionBridge {
   ): Promise<TrustedExtensionUiResponse>;
   publishCommands(commands: TrustedExtensionCommand[]): void;
   publishDiagnostics(diagnostics: TrustedExtensionDiagnostic[]): void;
-  /** Optional read-only registry passed straight through to extensions. */
-  modelRegistry?: unknown;
+  /**
+   * Optional read-only registry passed straight through to extensions. Only
+   * the supported members are declared here; the Runner adds every other
+   * `ModelRegistry` member as inert (spec 16 §5).
+   */
+  modelRegistry?: ExtensionModelRegistry;
 }
 
 type ToolDefinitionLike = {
@@ -632,6 +662,28 @@ export class TrustedExtensionRunner {
     };
   }
 
+  /**
+   * Copy the host-provided registry and fill in every unsupported member as
+   * inert, so an extension sees the whole `ModelRegistry` shape instead of a
+   * `TypeError: not a function` (spec 16 §5). A member the host provided — even
+   * an explicitly `undefined` one — always wins and is never wrapped.
+   */
+  private modelRegistryContext(
+    extension: LoadedExtension,
+  ): Record<string, unknown> {
+    const provided = this.bridge.modelRegistry;
+    const registry: Record<string, unknown> = provided ? { ...provided } : {};
+    for (const { member, neutral } of INERT_MODEL_REGISTRY_MEMBERS) {
+      if (Object.prototype.hasOwnProperty.call(registry, member)) continue;
+      registry[member] = this.inert(
+        extension,
+        `modelRegistry.${member}`,
+        neutral(),
+      );
+    }
+    return registry;
+  }
+
   private exec(
     command: string,
     args: string[],
@@ -724,7 +776,7 @@ export class TrustedExtensionRunner {
         getSessionId: () => bridge.sessionId,
         getCwd: () => bridge.cwd,
       },
-      modelRegistry: bridge.modelRegistry ?? {},
+      modelRegistry: this.modelRegistryContext(extension),
       get model() {
         return bridge.getModel();
       },

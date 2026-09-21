@@ -13,3 +13,11 @@ export {
   type TrustedExtensionEventName,
   type TrustedExtensionRunnerOptions,
 } from "./runner.js";
+export {
+  createExtensionModelRegistry,
+  type ExtensionModelRefreshResult,
+  type ExtensionModelRegistry,
+  type ExtensionModelRegistryOptions,
+  type ExtensionProviderAuthStatus,
+  type HostModelDescriptor,
+} from "./provider-access.js";
