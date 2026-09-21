@@ -313,6 +313,7 @@ type PluginPermission =
  | "agent.tool.register"
  | "agent.prompt.inject"
  | "provider.register"
+ | "provider.request"
  | "net.fetch"
  | "shell.openExternal"
  | "mcp.server.local"

@@ -32,6 +32,7 @@ export const HIGH_RISK_PERMISSIONS = [
   "browser.cdp",
   "audio.capture.background",
   "speech.adapter.register",
+  "provider.request",
 ] as const;
 
 /** Host API surface each permission unlocks, used for the unused-permission hint. */
@@ -91,6 +92,9 @@ const PERMISSION_API_HINTS: Record<string, string[]> = {
     "browser.console",
     "browser.cdp",
   ],
+  // The extension member itself. Only the entry source is scanned, so a plugin
+  // whose extension lives in its own `agentExtensions` file still hints unused.
+  "provider.request": ["providers.request"],
 };
 
 export type CheckIssue = {
