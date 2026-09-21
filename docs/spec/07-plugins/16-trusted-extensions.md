@@ -292,6 +292,18 @@ the declaration so `getFlag` works but exposes no CLI or UI in v1;
 `sessionManager` accessors return empty results; UI setters return a no-op
 `dispose`.
 
+`modelRegistry` is a Runner-scoped snapshot of the ready host models, projected
+by Electron main and gated by `models.list`: enabled provider rows whose auth is
+complete, enriched with catalog metadata, carrying `baseUrl` and capability
+fields and no credential material. Without that grant it answers with the session
+model and plugin-registered agent models only. `getAll` and `getAvailable`
+project the same ready set. Reads are synchronous from the snapshot, and
+`refresh()` re-fetches it. Every upstream member PI does not implement —
+`getProvider`, `getError`, `isUsingOAuth`, `getApiKeyAndHeaders`,
+`getApiKeyForProvider`, `getProviderAuth`, `complete`, `stream`, `streamSimple`,
+and the registration family — exists and returns its documented neutral value
+with one diagnostic per extension per member (ADR 0300).
+
 ## 6. Event mapping
 
 Events fire from the desktop runtime's existing hook points. Handler results
@@ -388,6 +400,7 @@ No host-core RPC method, protocol version, or SQLite schema changes in v1.
 | `extensions.diagnostics.publish` | Replace the session's diagnostics list |
 | `extensions.model.configure` | Validate and persist a plugin-owned provider/model binding through `session.configure`, then broadcast `session:modelChanged` |
 | `session.rename`, `session.create`, `session.fork`, `session.queuePush`, `session.queuePrioritize` | Existing methods, now reachable from the adapter |
+| `extensions.providers.list` | Project the ready host-model catalogue to the session's extensions, gated by `models.list` (ADR 0300) |
 
 ### 10.2 Main ↔ renderer (Electron IPC)
 
@@ -438,7 +451,10 @@ runtime, main, and renderer tracks in parallel.
 - A fixture set of sample extensions covering each supported member runs as a
   contract test on every upgrade.
 - New `ExtensionAPI` members land in the Unsupported class with a
-  diagnostic until a later decision moves them.
+- New `ExtensionAPI` members land in the Unsupported class with a
+  diagnostic until a later decision moves them. A member becomes supported only
+  in the change that records that decision: `modelRegistry` moved by ADR 0300,
+  whose request members arrive with their own record.
 - Public documentation promises only the Supported and Supported-on-context
   classes in §5.
 

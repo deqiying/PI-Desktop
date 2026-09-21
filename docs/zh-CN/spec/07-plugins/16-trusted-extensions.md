@@ -169,6 +169,15 @@ main、渲染层或插件宿主进程中。
 但 v1 不暴露 CLI 或 UI；`sessionManager` 访问器返回空结果；UI setter 返回空操作
 的 `dispose`。
 
+`modelRegistry` 是由 Electron main 投影、经 `models.list` 门控的、Runner 作用域的
+就绪宿主模型快照：已启用且认证完整的 provider 行，用目录元数据补全，携带 `baseUrl`
+与能力字段，且不含任何凭据材料。没有该授权时，它只返回会话模型与插件注册的 agent
+模型。`getAll` 与 `getAvailable` 投影同一份就绪集合。读取从快照同步进行，
+`refresh()` 重新拉取快照。PI 未实现的所有上游成员——`getProvider`、`getError`、
+`isUsingOAuth`、`getApiKeyAndHeaders`、`getApiKeyForProvider`、`getProviderAuth`、
+`complete`、`stream`、`streamSimple`，以及注册系列——都存在、返回其文档化的中性值，
+并按扩展、按成员各产生一条诊断（ADR 0300）。
+
 ## 6. 事件映射
 
 事件从桌面运行时现有的 hook 点触发。凡事件类型定义了返回结果的，处理器结果
@@ -253,6 +262,7 @@ v1 不改任何 host-core RPC 方法、协议版本或 SQLite schema。
 | `extensions.diagnostics.publish` | 替换会话的诊断列表 |
 | `extensions.model.configure` | 校验插件自有的 provider/模型绑定，经 `session.configure` 持久化，然后广播 `session:modelChanged` |
 | `session.rename`、`session.create`、`session.fork`、`session.queuePush`、`session.queuePrioritize` | 已有方法，现可从适配层到达 |
+| `extensions.providers.list` | 把就绪宿主模型目录投影给会话的扩展，由 `models.list` 门控（ADR 0300） |
 
 ### 10.2 main ↔ 渲染层（Electron IPC）
 
@@ -299,7 +309,9 @@ v1 交付顺序：打包 spike（E2E-245）、shared 协议类型，然后运行
 - 升级任一 pi 包即同时升级三个包。
 - 一组覆盖每个受支持成员的样例扩展在每次升级时作为契约测试运行。
 - 新增的 `ExtensionAPI` 成员先落入“不支持”类别并产生诊断，直到后续决策
-  移动它们。
+- 新增的 `ExtensionAPI` 成员先落入“不支持”类别并产生诊断，直到后续决策
+  移动它们。成员只在记录该决策的同一次变更中转为受支持：`modelRegistry` 由
+  ADR 0300 移动，其请求类成员将随各自的记录到达。
 - 对外文档只承诺 §5 中“支持”和“上下文上支持”两个类别。
 
 ## 14. 待决事项
