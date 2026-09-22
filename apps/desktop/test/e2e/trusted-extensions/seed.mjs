@@ -162,8 +162,11 @@ function pluginFor(name) {
   // The agent fixture also declares a provider row (ADR 0259): the declaration
   // materializes in the native provider list, owned by this plugin.
   if (name === "agent") {
-    // `models.list` gates the host catalogue (ADR 0304). The other fixtures keep
-    // only `agent.extension`, so this also exercises the union-of-grants rule.
+    // `models.list` gates the host catalogue (ADR 0304): only this fixture
+    // declares it, so the host catalogue stays out of the other fixtures'
+    // reach. The union-of-grants residual — a contributing sibling's grant
+    // being usable from the same sidecar process — is not asserted here; that
+    // would need a second module reading the registry without the grant.
     permissions.push("provider.register", "models.list");
     contributes.providers = [{
       id: "declared",
