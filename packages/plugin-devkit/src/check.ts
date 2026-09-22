@@ -19,17 +19,28 @@ import {
 
 /**
  * Permissions the permission dialog surfaces as high risk. Kept in sync with
- * `PERMISSION_RISK` in apps/desktop/src/features/plugins/model.ts, which is the
- * copy the install dialog actually renders.
+ * the explicit `high` entries of `PERMISSION_RISK` in
+ * apps/desktop/src/features/plugins/model.ts, which is the copy the install
+ * dialog actually renders. A pre-scope fs name counts as high because the host
+ * rewrites it on load to the scoped write or delete it stands for.
  */
 export const HIGH_RISK_PERMISSIONS = [
   "net.fetch",
   "net.websocket",
   "fs.write",
   "fs.delete",
+  "fs.write.workspace",
+  "fs.delete.workspace",
   "agent.prompt.inject",
   "agent.tool.register",
+  "agent.complete",
+  "agent.extension",
+  "desktop.control",
+  "session.read",
   "browser.cdp",
+  "mcp.server.local",
+  "mcp.server.remote",
+  "background.service",
   "audio.capture.background",
   "speech.adapter.register",
   "provider.request",
