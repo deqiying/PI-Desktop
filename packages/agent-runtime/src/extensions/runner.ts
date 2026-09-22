@@ -210,11 +210,14 @@ export interface TrustedExtensionBridge {
   publishCommands(commands: TrustedExtensionCommand[]): void;
   publishDiagnostics(diagnostics: TrustedExtensionDiagnostic[]): void;
   /**
-   * Optional read-only registry passed straight through to extensions. Only
-   * the supported members are declared here; the Runner adds every other
-   * `ModelRegistry` member as inert (spec 16 §5).
+   * Optional read-only registry the host provides. It carries whichever
+   * members the host implements — normally the supported `ExtensionModelRegistry`
+   * set — and the Runner copies it and adds every missing `ModelRegistry` member
+   * as inert (spec 16 §5), so a host that provides a subset, a test double, or
+   * nothing at all is still a valid bridge. A provided member always wins and is
+   * never wrapped.
    */
-  modelRegistry?: ExtensionModelRegistry;
+  modelRegistry?: Partial<ExtensionModelRegistry> & Record<string, unknown>;
   /**
    * Session-scoped provider request client. The Runner binds it per extension,
    * because main takes the *claimed* `extensionId` for audit attribution while
