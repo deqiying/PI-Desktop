@@ -657,21 +657,25 @@ HTTP 4xx/5xx 是结果，不是错误码（D6）。路径、上限或部分形�
 | 目录投影 | `plugin-agent-complete.ts` 旁的新模块 | 带 `baseUrl`、能力字段与脱敏的就绪模型投影；`PluginModelInfo` 获得可选字段 |
 | 传输截止时间 | `packages/shared/src/rpc-timeouts.ts:54-56` | 为请求方法的截止时间增加一条表项或调用点覆盖（D8） |
 | SDK 类型 | `packages/plugin-sdk/src/index.ts:703-717` | 在 `PluginModelInfo` 上增加可选字段 |
-| 权限注册 | `packages/plugin-sdk/src/index.ts:1247-1291`（`PLUGIN_PERMISSIONS`）、`docs/spec/07-plugins/02-plugin-manifest-schema.md:301-343`（§5 枚举，权威：未知权限会导致校验失败）、`apps/desktop/src/features/plugins/model.ts:39-122`（`PERMISSION_RISK`）、`packages/plugin-devkit/src/check.ts:25-35`（`HIGH_RISK_PERMISSIONS`）及其 `PERMISSION_API_HINTS` | 在每一份副本中声明 `provider.request` |
+| 权限注册 | `packages/plugin-sdk/src/index.ts:1258-1305`（`PLUGIN_PERMISSIONS`）、`docs/spec/07-plugins/02-plugin-manifest-schema.md:314-354`（§5 枚举，权威：未知权限会导致校验失败）、`apps/desktop/src/features/plugins/model.ts:39-82`（`PERMISSION_RISK`）、`packages/plugin-devkit/src/check.ts:27-47`（`HIGH_RISK_PERMISSIONS`）及其 `PERMISSION_API_HINTS` | 在每一份副本中声明 `provider.request` |
 | i18n | `packages/i18n/src/locales/*/index.ts` | 每个语言环境中的权限标签与描述 |
 | Devkit 与文档 | `packages/plugin-devkit`、`docs/plugin-development.md` | 公布新成员 |
 
 三项同步义务，其中两项是本变更不得静默继承的既有缺陷：
 
-- 权限枚举被重复了四次，而 spec `07-plugins/02-plugin-manifest-schema.md:301-343` 是
+- 权限枚举被重复了四次，而 spec `07-plugins/02-plugin-manifest-schema.md:314-354` 是
   权威副本（"未知权限 = 校验失败"）。它当前**遗漏**了 `models.list`、`agent.complete`、
-  `agent.extension` 和 `session.read`，而它们都在 `PLUGIN_PERMISSIONS` 中——也就是说
-  SDK 已经接受 manifest 规格判定为无效的 manifest。加入 `provider.request` 也必须
-  更新这份副本；既有缺口会被报告，而不是被悄悄扩大。
-- `packages/plugin-devkit/src/check.ts:25-35` 在其注释中声称镜像 `PERMISSION_RISK`，
-  但遗漏了 `agent.complete`、`agent.extension`、`desktop.control` 和 `session.read`，
-  而 `apps/desktop/src/features/plugins/model.ts:39-51` 将它们标为高风险。新权限进入
-  这两处，偏差会被报告。
+  `agent.extension`、`session.read` 和 `ui.settings`，而它们都在 `PLUGIN_PERMISSIONS`
+  中——也就是说 SDK 已经接受 manifest 规格判定为无效的 manifest。加入 `provider.request`
+  也必须更新这份副本：S3 加入了 `provider.request` 并补齐了缺口，枚举现在已与
+  `PLUGIN_PERMISSIONS` 逐项一致。
+- `packages/plugin-devkit/src/check.ts` 在其注释中声称镜像 `PERMISSION_RISK`，
+  但遗漏了 `fs.write.workspace`、`fs.delete.workspace`、`agent.complete`、
+  `agent.extension`、`desktop.control`、`session.read`、`mcp.server.local`、
+  `mcp.server.remote` 和 `background.service`，而
+  `apps/desktop/src/features/plugins/model.ts` 将它们标为高风险。S3 把
+  `provider.request` 与这些缺失的名字加入了这两份副本，因此该清单已与 renderer 的
+  显式 high 档一致。
 - 根 `AGENTS.md:106` 把插件工作路由到 `packages/plugin-sdk/AGENTS.md` 和该包 README；
   两者都不存在。这里的局部规则来自根 `AGENTS.md`、spec 07 和既有测试——这是一个要
   报告的文档缺口，不是要凭空发明的东西。
@@ -760,9 +764,11 @@ HTTP 4xx/5xx 是结果，不是错误码（D6）。路径、上限或部分形�
   读取器抽取、响应契约、限流、中止注册表，以及审计行。ADR 与规格更新：spec 16 §5 与
   §10.1、spec 12 §6.1 的声明与审计名称、spec 13 权限矩阵、若新增错误码则更新
   spec 03 错误码。
-- **S3 —— 表面。** `docs/plugin-development.md`、devkit 类型与提示表、一个示例扩展，
-  以及 `docs/project/README.md` 索引。§6 中的两处权限枚举偏差在此修复，或作为后续事项
-  报告，绝不静默扩大。
+- **S3 —— 表面。** `docs/plugin-development.md` §1/§6.12/§7/§12 及其 zh-CN 镜像、
+  devkit 类型与提示表（声明的权限现在同时会在入口文件*和*每个
+  `contributes.agentExtensions` 模块中查找，因此扩展里的 provider 调用不再被报为
+  未使用）、`examples/plugins/provider-request` 示例，以及 `docs/project/README.md`
+  索引。§6 中的两处权限枚举偏差都在本阶段修复：既不扩大，也不留作后续事项。
 
 ADR 必须在需要它的那个阶段实现之前存在，而不是之后：这会增加公开扩展契约成员、一个
 新的高风险授权，以及扩展代码带着凭据触达用户 provider 的新途径（根 `AGENTS.md` §4）。

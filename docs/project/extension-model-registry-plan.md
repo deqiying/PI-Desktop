@@ -765,7 +765,7 @@ throws instead, because the request never left the host.
 | Catalogue projection | new module beside `plugin-agent-complete.ts` | ready-model projection with `baseUrl`, capability fields, and redaction; `PluginModelInfo` gains optional fields |
 | Transport deadline | `packages/shared/src/rpc-timeouts.ts:54-56` | an entry or call-site override for the request method's deadline (D8) |
 | SDK types | `packages/plugin-sdk/src/index.ts:703-717` | additive optional fields on `PluginModelInfo` |
-| Permission registration | `packages/plugin-sdk/src/index.ts:1247-1291` (`PLUGIN_PERMISSIONS`), `docs/spec/07-plugins/02-plugin-manifest-schema.md:301-343` (§5 enum, authoritative: an unknown permission fails validation), `apps/desktop/src/features/plugins/model.ts:39-122` (`PERMISSION_RISK`), `packages/plugin-devkit/src/check.ts:25-35` (`HIGH_RISK_PERMISSIONS`) and its `PERMISSION_API_HINTS` | declare `provider.request` in every copy |
+| Permission registration | `packages/plugin-sdk/src/index.ts:1258-1305` (`PLUGIN_PERMISSIONS`), `docs/spec/07-plugins/02-plugin-manifest-schema.md:314-354` (§5 enum, authoritative: an unknown permission fails validation), `apps/desktop/src/features/plugins/model.ts:39-82` (`PERMISSION_RISK`), `packages/plugin-devkit/src/check.ts:27-47` (`HIGH_RISK_PERMISSIONS`) and its `PERMISSION_API_HINTS` | declare `provider.request` in every copy |
 | i18n | `packages/i18n/src/locales/*/index.ts` | permission label and description in every locale |
 | Devkit and docs | `packages/plugin-devkit`, `docs/plugin-development.md` | publish the new members |
 
@@ -773,17 +773,20 @@ Three synchronization obligations, two of them pre-existing defects this change
 must not silently inherit:
 
 - The permission enum is duplicated four times, and spec
-  `07-plugins/02-plugin-manifest-schema.md:301-343` is the authoritative copy
+  `07-plugins/02-plugin-manifest-schema.md:314-354` is the authoritative copy
   ("unknown permission = validation failure"). It currently **omits**
-  `models.list`, `agent.complete`, `agent.extension`, and `session.read`, all of
-  which are in `PLUGIN_PERMISSIONS` — so the SDK already accepts manifests the
-  manifest spec calls invalid. Adding `provider.request` must update this copy
-  too; the existing gap is reported rather than quietly widened.
-- `packages/plugin-devkit/src/check.ts:25-35` claims in its comment to mirror
-  `PERMISSION_RISK`, but omits `agent.complete`, `agent.extension`,
-  `desktop.control`, and `session.read`, which
-  `apps/desktop/src/features/plugins/model.ts:39-51` marks high. The new
-  permission goes into both, and the drift is reported.
+  `models.list`, `agent.complete`, `agent.extension`, `session.read`, and
+  `ui.settings`, all of which are in `PLUGIN_PERMISSIONS` — so the SDK already
+  accepts manifests the manifest spec calls invalid. Adding `provider.request`
+  must update this copy too: S3 added `provider.request` and closed the gap, so
+  the enum now matches `PLUGIN_PERMISSIONS` member for member.
+- `packages/plugin-devkit/src/check.ts` claims in its comment to mirror
+  `PERMISSION_RISK`, but omitted `fs.write.workspace`, `fs.delete.workspace`,
+  `agent.complete`, `agent.extension`, `desktop.control`, `session.read`,
+  `mcp.server.local`, `mcp.server.remote`, and `background.service`, which
+  `apps/desktop/src/features/plugins/model.ts` marks high. S3 added
+  `provider.request` and the missing names to both copies, so the list equals
+  the renderer's explicit high tier.
 - Root `AGENTS.md:106` routes plugin work to `packages/plugin-sdk/AGENTS.md` and
   the package README; neither exists. The scoped rules here come from root
   `AGENTS.md`, spec 07, and the existing tests — a documentation gap to report,
@@ -900,10 +903,13 @@ before the decision that moves it exists.
   audit line. ADR + spec updates: spec 16 §5 and §10.1, spec 12 §6.1 declaration
   and audit names, spec 13 permissions matrix, spec 03 error codes if new codes
   are added.
-- **S3 — surfaces.** `docs/plugin-development.md`, the devkit types and hint
-  tables, an example extension, and the `docs/project/README.md` index. The two
-  permission-enum drifts in §6 are either fixed here or reported as follow-ups,
-  never silently extended.
+- **S3 — surfaces.** `docs/plugin-development.md` §1/§6.12/§7/§12 and its zh-CN
+  mirror, the devkit types and hint tables (a declared permission is now looked
+  for in the entry file *and* in every `contributes.agentExtensions` module, so
+  a provider call in an extension is no longer reported unused), the
+  `examples/plugins/provider-request` example, and the `docs/project/README.md`
+  index. Both permission-enum drifts in §6 are fixed in this stage, not widened
+  and not left as follow-ups.
 
 An ADR is required before the implementation of the stage that needs it, not
 after: this adds public extension contract members, a new high-risk grant, and a
