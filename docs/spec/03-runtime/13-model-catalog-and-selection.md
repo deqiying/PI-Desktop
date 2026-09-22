@@ -98,7 +98,12 @@ default. When the edited service or account is the app's default provider,
 saving also synchronizes the app-level default model to that first binding,
 as the existing save flow does. The app default is unchanged when editing
 another provider, and an explicitly bound session keeps its stored model
-choice. No storage schema or IPC contract changes are required.
+choice. Adding a provider is not a way to change either app default: the
+default model, and the default image model when the new service brings image
+models, move to it only while nothing resolves for the app — an empty
+selection, or one whose provider or model is gone. A default the user can
+still run stays where it is until they repoint it. No storage schema or IPC
+contract changes are required.
 
 ### Discovery precedence
 
@@ -378,6 +383,13 @@ App-level default:
 - the picker supports local search across provider name and model ID; its result list scrolls within the floating surface and shows an explicit empty state when no model matches
 - the picker uses concise settings-specific search copy; each result gives visual priority to the model ID and keeps the provider as secondary metadata
 - results are grouped by provider so a provider name is shown once per group rather than repeated on every model row
+- a provider is named the same way here as in the Composer menu: an OAuth row
+  uses its non-secret account label when present, so two accounts of one vendor
+  stay distinguishable in the group heading, in the summary line that reports
+  the current default, and in each option's accessible name. Search matches the
+  account label and the vendor name, so either spelling reaches the row
+- the Settings prompt-enhancement model picker reuses this menu and resolves its
+  provider names the same way
 - if none configured, onboarding checklist requires provider setup before first agent run
 
 Session-level:

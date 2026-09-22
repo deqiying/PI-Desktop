@@ -187,7 +187,7 @@ test("the review contract is shared, not re-declared on each side", () => {
   assert.match(protocolSrc, /pluginReloadConfirm: "pi-desktop\/plugin\/reloadConfirm"/);
 });
 
-// ADR 0301 decision 7: the request grant reaches the whole provider API surface
+// ADR 0305 decision 7: the request grant reaches the whole provider API surface
 // with the user's credential, so a manifest may declare it and both copies of
 // the risk list have to classify it high before the review asks the user.
 test("the request grant validates and is reviewed as high risk", () => {

@@ -1,5 +1,9 @@
+import { restoreHostedSearchReplay } from "./hosted-search-replay.js";
+import { requestExtensionUi } from "./extensions/ui-request.js";
+import { readLocalRequestErrorDetails } from "./local-request-errors.js";
 import { imageGenerationDescription, imageGenerationParameters } from "./image-generation/tool.js";
 import { scheduledToolParameters, scheduledToolDescriptions } from "./scheduled-tools.js";
+import { withPiFileOpToolNames } from "./pi-file-ops.js";
 import { randomUUID } from "node:crypto";
 import {
   settledDelegationMessage,
@@ -50,7 +54,6 @@ import {
   type TrustedExtensionCommand,
   type TrustedExtensionDiagnostic,
   type TrustedExtensionSpec,
-  type TrustedExtensionUiRequest,
   type TrustedExtensionUiResponse,
 } from "@pi-desktop/shared";
 import {
@@ -125,10 +128,18 @@ import {
   timestampMs,
   toJsonObject,
   toJsonValue,
+  truncateTextWithMarker,
   usageFromPi,
   usageToPi,
 } from "./agent-messages.js";
 import { buildSessionContext } from "./session-context.js";
+import {
+  initialSystemTranscript,
+  rebuildSystemTranscript,
+  replaceSystemPrompt,
+  syncSystemTools,
+  systemPromptContent,
+} from "./system-transcript.js";
 import {
   dedupeToolCallMessages,
   reportDuplicateToolCallDrop,
@@ -140,7 +151,6 @@ import {
   createExtensionAgentModels,
   createProviderModels,
   DEFAULT_CONTEXT_WINDOW,
-  DEFAULT_MAX_TOKENS,
   providerRequestKey,
   type RuntimeProviderConfig,
 } from "./provider-binding.js";
@@ -201,10 +211,20 @@ import {
 } from "./opencode-session-headers.js";
 import { withCompactionRequestHeaders } from "./compaction-request.js";
 import {
+  addSummaryUsage,
+  compactionSummaryInputLimit,
+  compactionSummaryOutputBudget,
   COMPACTION_SUMMARY_RETRY_POLICY,
   estimateSummaryPromptTokens,
+  planSummaryChunks,
   reduceSummaryInput,
 } from "./compaction-summary-input.js";
+import {
+  CHECKPOINT_TRUNCATION_MARKER,
+  COMPACTION_RETAINED_TAIL_SHAPE,
+  replayRetainedTail,
+  selectRecentTail,
+} from "./compaction-tail.js";
 import {
   mergeProviderHeaders,
   providerHeadersEqual,
@@ -568,9 +588,18 @@ function formatDelegationResults(
     includedDelegationIds,
   };
 }
-const COMPACTION_FALLBACK_KEEP_RECENT_RATIO = 0.25;
 const COMPACTION_FALLBACK_MAX_SUMMARY_CHARS = 12_000;
-const COMPACTION_SUMMARY_PROMPT_SAFETY_TOKENS = 2_048;
+/**
+ * Room held back from a fallback's tail for the recovery notice the checkpoint
+ * appends after the carried-forward summary.
+ */
+const COMPACTION_FALLBACK_NOTICE_TOKENS = 512;
+/**
+ * Share of the safe budget a failure's retained window may occupy. The window
+ * is bounded by the keep-recent target as well, so it never carries more
+ * history than a successful checkpoint would (`fallbackRetainedTail`).
+ */
+const COMPACTION_FALLBACK_KEEP_RECENT_RATIO = 0.25;
 export const COMPACTION_FALLBACK_MARKER =
   "[automatic context recovery: older context was omitted after summary generation failed]";
 /** Stored in place of a carried-forward summary when a fallback had none. */
@@ -597,6 +626,15 @@ function stripCompactionFallbackNotice(
     return undefined;
   }
   return carried;
+}
+
+/**
+ * File operations for a summary chunk that must not re-append the checkpoint's
+ * file lists: the last chunk carries the real ones, so a chained summary names
+ * each file once.
+ */
+function emptyFileOps(): CompactionPreparation["fileOps"] {
+  return { read: new Set(), written: new Set(), edited: new Set() };
 }
 /** Path-scoped rules are best-effort and must not stall a file tool turn. */
 export const PATH_INSTRUCTION_RESOLUTION_TIMEOUT_MS = 2_000;
@@ -681,8 +719,6 @@ function pathInstructionScope(path: string): string {
   return slash >= 0 ? normalized.slice(0, slash) || "/" : ".";
 }
 
-const CHECKPOINT_TRUNCATION_MARKER =
-  "\n\n[checkpoint truncated: this message crossed the retained context budget]\n\n";
 /**
  * Appended for one automatic re-run after a turn that produced nothing the
  * user can see. Two shapes were observed: a wholly empty response, and a
@@ -1011,12 +1047,26 @@ type CheckpointBuildSuccess = {
   preparation: ShapedPreparation;
 };
 
+/**
+ * Why a checkpoint had to fall back, recorded on the fallback's `details` so a
+ * later report says more than `usage: null` does (issue #827). Deliberately a
+ * closed vocabulary: provider error text can carry endpoint details, and ADR
+ * 0049 keeps it out of the persisted record.
+ */
+type CompactionFailureReason =
+  | "no_new_history"
+  | "summary_budget"
+  | "summary_provider"
+  | "checkpoint_oversized";
+
 type CheckpointBuildFailure = {
   ok: false;
   entries: Entry[];
   budget: ContextBudget;
   preparation?: ShapedPreparation;
   message: string;
+  /** Recorded on the fallback checkpoint when this failure recovers to one. */
+  failureReason?: CompactionFailureReason;
   tokensBefore?: number;
   /**
    * False when the failure must be reported as-is instead of falling back to a
@@ -1038,11 +1088,29 @@ function compactionRetentionMode(details: unknown): CompactionRetentionMode {
     : "active_turn";
 }
 
+/**
+ * The messages a stored checkpoint replays as real context after its summary.
+ *
+ * A checkpoint that recorded {@link COMPACTION_RETAINED_TAIL_SHAPE} keeps the
+ * whole window it stored: it is a failed compaction's only record of the range
+ * behind it, so narrowing the tail back to one user message would reinstate
+ * exactly the amnesia the window fixes (#827). Records written before that
+ * marker existed — and every successful checkpoint — keep the older
+ * normalization: at most the latest user message, and none at all once the turn
+ * is complete, so a restart cannot restore a sequence of executable-looking old
+ * requests.
+ */
 function retainedTailForContext(
   value: unknown,
   details?: unknown,
 ): AgentMessage[] | undefined {
   if (!Array.isArray(value)) return undefined;
+  if (
+    isRecord(details) &&
+    details.retainedTailShape === COMPACTION_RETAINED_TAIL_SHAPE
+  ) {
+    return replayRetainedTail(value) ?? [];
+  }
   const messages = value
     .filter(isRecord)
     .filter((message) => message.role === "user") as unknown as AgentMessage[];
@@ -1280,17 +1348,9 @@ function appendToolProgress(current: string, chunk: string): string {
   }`;
 }
 
+/** Bound a checkpoint message's text, naming the cut the way pi's tail does. */
 function truncateTextForCheckpoint(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  if (maxChars <= CHECKPOINT_TRUNCATION_MARKER.length) {
-    return CHECKPOINT_TRUNCATION_MARKER.trim().slice(0, maxChars);
-  }
-  const retainedChars = maxChars - CHECKPOINT_TRUNCATION_MARKER.length;
-  const headChars = Math.ceil(retainedChars * 0.75);
-  const tailChars = retainedChars - headChars;
-  return `${text.slice(0, headChars)}${CHECKPOINT_TRUNCATION_MARKER}${
-    tailChars > 0 ? text.slice(-tailChars) : ""
-  }`;
+  return truncateTextWithMarker(text, maxChars, CHECKPOINT_TRUNCATION_MARKER);
 }
 
 /**
@@ -1834,8 +1894,11 @@ Delegation rules:
         // Park what this request is expected to cost, so the usage report that
         // settles it can be measured against it (`contextBudget` corrects the
         // same shape).
+        // The target model travels with the estimate: hosted search only
+        // costs what this model's adapter will actually replay.
         this.inFlightContextEstimate = estimateContextTokens(
           context.messages ?? [],
+          m,
         );
         // A new model request starts a new transport streak: the evidence that
         // justified a rebuild does not carry into the next request (issue #234).
@@ -1952,11 +2015,10 @@ Delegation rules:
         this.prepareNextTurn(context, signal),
       afterToolCall: async (context) => this.afterToolCall(context),
       initialState: {
-        systemPrompt: this.composeSystemPrompt(),
         model,
         tools,
         thinkingLevel: agentThinkingLevel(this.thinkingLevel),
-        messages: this.liveSessionContext().messages,
+        messages: initialSystemTranscript(this.composeSystemPrompt(), tools, this.liveSessionContext().messages),
       },
       // Plan transitions must be the only tool call in an assistant batch.
       // Sequential execution also makes the host-confirmed mode change visible
@@ -2024,7 +2086,7 @@ Delegation rules:
     this.rebuildToolCatalog();
     this.restoreDeferredToolsFromContext();
     this.setAgentSystemPrompt(this.composeSystemPrompt());
-    this.agent.state.tools = this.activeTools();
+    this.setAgentTools(this.activeTools());
     this.setPlanningState(planningState, details);
   }
 
@@ -2047,11 +2109,7 @@ Delegation rules:
       (this.agent.state as unknown as { systemPrompt: string }).systemPrompt = prompt;
       return;
     }
-    const messages = this.agent.state.messages.filter((message) => message.role !== "system");
-    this.agent.state.messages = [
-      { role: "system", content: prompt, timestamp: Date.now() },
-      ...messages,
-    ];
+    this.agent.state.messages = replaceSystemPrompt(this.agent.state.messages, prompt);
   }
 
   private setAgentMessages(messages: AgentMessage[]): void {
@@ -2059,11 +2117,23 @@ Delegation rules:
       this.agent.state.messages = messages;
       return;
     }
-    const systemPrompt = this.agent.state.systemPrompt;
-    this.agent.state.messages = [
-      { role: "system", content: systemPrompt, timestamp: Date.now() },
-      ...messages.filter((message) => message.role !== "system"),
-    ];
+    this.agent.state.messages = syncSystemTools(
+      rebuildSystemTranscript(this.agent.state.messages, messages),
+      this.agent.state.tools,
+    );
+  }
+
+  private setAgentTools(tools: AgentTool[]): void {
+    this.agent.state.tools = tools;
+    if (this.agentUsesTranscriptSystemMessages()) {
+      this.agent.state.messages = syncSystemTools(this.agent.state.messages, tools);
+    }
+  }
+
+  private agentSystemPromptContent(): string {
+    return this.agentUsesTranscriptSystemMessages()
+      ? systemPromptContent(this.agent.state.messages)
+      : this.agent.state.systemPrompt;
   }
 
   private composeSystemPrompt(): string {
@@ -2102,7 +2172,7 @@ Delegation rules:
     if (this.subagents.length === 0) return;
     if (!this.agent) return;
     if (this.composedSystemPrompt === undefined) return;
-    if (this.agent.state.systemPrompt !== this.composedSystemPrompt) {
+    if (this.agentSystemPromptContent() !== this.composedSystemPrompt) {
       // A transient variant (the delegation nudge) owns the live prompt. Its
       // own cleanup restores the composed text, and applies this refresh then,
       // so a chain that settled mid-nudge is still listed on the next turn.
@@ -2378,7 +2448,7 @@ Delegation rules:
     await runner.load();
     if (this.disposed) return;
     this.rebuildToolCatalog();
-    this.agent.state.tools = this.activeTools();
+    this.setAgentTools(this.activeTools());
   }
 
   /** Run a registered extension slash command in this session (spec 16 §8). */
@@ -2425,7 +2495,7 @@ Delegation rules:
     return true;
   }
 
-  private async setExtensionModel(model: unknown): Promise<boolean> {
+  private async setExtensionModel(model: unknown, signal?: AbortSignal): Promise<boolean> {
     if (!this.extensionRunner || !this.isIdle()) return false;
     const agent = this.extensionRunner.findAgentModel(model);
     if (!agent) return false;
@@ -2442,7 +2512,7 @@ Delegation rules:
         modelId: candidate.id,
         thinkingLevel: this.thinkingLevel,
       });
-      if (result?.ok === false) return false;
+      if (signal?.aborted || this.disposed || result?.ok === false) return false;
       this.applyExtensionAgent(agent, candidate);
       return true;
     } catch {
@@ -2500,7 +2570,7 @@ Delegation rules:
       sessionId: this.sessionId,
       cwd: this.projectPath ?? process.cwd(),
       getModel: () => runtime.model,
-      setModel: (model) => runtime.setExtensionModel(model),
+      setModel: (model, signal) => runtime.setExtensionModel(model, signal),
       modelRegistry,
       providers,
       getThinkingLevel: () => agentThinkingLevel(runtime.thinkingLevel),
@@ -2539,18 +2609,19 @@ Delegation rules:
           if (wanted.has(name)) runtime.activeDeferredToolNames.add(name);
           else runtime.activeDeferredToolNames.delete(name);
         }
-        runtime.agent.state.tools = runtime.activeTools();
+        runtime.setAgentTools(runtime.activeTools());
       },
       getSessionName: () => runtime.extensionSessionName,
-      setSessionName: async (name) => {
-        runtime.extensionSessionName = name;
+      setSessionName: async (name, signal) => {
         await runtime.host.call("session.rename", { id: runtime.sessionId, title: name });
+        if (signal?.aborted || runtime.disposed) return;
+        runtime.extensionSessionName = name;
         void runtime.extensionRunner?.emit("session_info_changed", {
           type: "session_info_changed",
           name,
         });
       },
-      sendUserMessage: async (content, options) => {
+      sendUserMessage: async (content, options, signal) => {
         const text = Array.isArray(content)
           ? content
               .map((part) => (isRecord(part) && typeof part.text === "string" ? part.text : ""))
@@ -2564,7 +2635,7 @@ Delegation rules:
           idempotencyKey: randomUUID(),
           content: text,
         });
-        if (options?.deliverAs === "steer" && pushed?.id) {
+        if (!signal?.aborted && !runtime.disposed && options?.deliverAs === "steer" && pushed?.id) {
           await runtime.host
             .call("session.queuePrioritize", { sessionId: runtime.sessionId, id: pushed.id })
             .catch(() => undefined);
@@ -2593,18 +2664,13 @@ Delegation rules:
           return { cancelled: true };
         }
       },
-      requestUi: (extension, request) =>
-        runtime.host.call<TrustedExtensionUiResponse>("extensions.ui.request", {
+      requestUi: (extension, request, signal) => requestExtensionUi(
+        (envelope) => runtime.host.call<TrustedExtensionUiResponse>("extensions.ui.request", envelope), {
           sessionId: runtime.sessionId,
           extensionId: extension.id,
           extensionLabel: extension.label,
           request,
-        } satisfies {
-          sessionId: string;
-          extensionId: string;
-          extensionLabel: string;
-          request: TrustedExtensionUiRequest;
-        }),
+        }, signal),
       publishCommands: (commands: TrustedExtensionCommand[]) => {
         void runtime.host
           .call("extensions.commands.publish", { sessionId: runtime.sessionId, commands })
@@ -2699,15 +2765,7 @@ Delegation rules:
               : {}),
           });
         }
-        const replay = m.hostedSearch?.replay;
-        if (Array.isArray(replay)) {
-          for (const block of replay) {
-            if (!block || typeof block !== "object" || block.type !== "hostedSearch") {
-              continue;
-            }
-            content.push(block as unknown as AssistantMessage["content"][number]);
-          }
-        }
+        content.push(...restoreHostedSearchReplay(m.hostedSearch));
         if (m.content?.trim()) {
           content.push({ type: "text" as const, text: m.content });
         }
@@ -3740,18 +3798,22 @@ Delegation rules:
    * On-demand model resolution for Task-time model overrides. Asks Electron
    * main to authorize and resolve a `providerId/modelId` key outside the
    * opted-in launch catalog. Grants live in a separate cache so they cannot
-   * rewrite definition pins or change launch-time reuse matching.
+   * rewrite definition pins or change launch-time reuse matching. Each new
+   * parent turn replaces the cache so revoked grants must be authorized again.
    */
   private async resolveSubagentModel(
     key: string,
   ): Promise<RuntimeProviderConfig | undefined> {
-    const cached = this.subagentOverrideProviders[key];
+    const grants = this.subagentOverrideProviders;
+    const cached = grants[key];
     if (cached) return cached;
     try {
       const result = await (this.host as any).call(
         "provider.resolveSubagentModel",
         { key },
       );
+      // A late response cannot authorize work in a newer turn or after disposal.
+      if (this.disposed || grants !== this.subagentOverrideProviders) return undefined;
       if (result && typeof result === "object" && "modelId" in result) {
         const provider = result as RuntimeProviderConfig;
         const pinned = this.subagentProviders[key];
@@ -3770,7 +3832,7 @@ Delegation rules:
               providerId: provider.id,
             });
         }
-        this.subagentOverrideProviders[key] = provider;
+        grants[key] = provider;
         return provider;
       }
     } catch {
@@ -3963,29 +4025,35 @@ Delegation rules:
   /**
    * The binding a resumed run keeps (ADR 0279 §4). A live chain records the
    * `providerId/modelId` key it resolved, which is preferred here; a chain
-   * rebuilt from the transcript only knows the model id, matched against what
-   * is configured in this session. `undefined` means the binding is gone.
+   * rebuilt from the transcript only knows the model id. Both paths are limited
+   * to this definition's pins, session inheritance, and current override grants.
    */
-  private resumedChainProvider(
+  private async resumedChainProvider(
     chain: DelegationChain,
-  ): RuntimeProviderConfig | undefined {
+    definition: SubagentDefinition,
+  ): Promise<RuntimeProviderConfig | undefined> {
     const modelId = chain.latestModelId?.trim().toLowerCase();
     if (!modelId) return undefined;
-    const candidates: RuntimeProviderConfig[] = [];
+    const keys = new Set(this.availableSubagentModelKeys());
+    if (definition.model) keys.add(subagentModelKey(definition.model));
+    for (const pin of definition.fallbackModels ?? []) keys.add(subagentModelKey(pin));
+    const binding = (key: string) => keys.has(key)
+      ? this.subagentProviders[key] ?? this.subagentOverrideProviders[key]
+      : undefined;
+    const matches = (candidate: RuntimeProviderConfig | undefined) =>
+      candidate?.modelId.trim().toLowerCase() === modelId;
     if (chain.latestModelKey) {
-      const keyed =
-        this.subagentProviders[chain.latestModelKey] ??
-        this.subagentOverrideProviders[chain.latestModelKey];
-      if (keyed) candidates.push(keyed);
+      const keyed = binding(chain.latestModelKey) ??
+        await this.resolveSubagentModel(chain.latestModelKey);
+      // A known binding must not silently become a different account with the
+      // same model id after its grant disappears.
+      return matches(keyed) ? keyed : undefined;
     }
-    candidates.push(
-      ...Object.values(this.subagentProviders),
-      ...Object.values(this.subagentOverrideProviders),
+    return [
+      this.subagentProvider(definition),
       this.provider,
-    );
-    return candidates.find(
-      (candidate) => candidate.modelId.trim().toLowerCase() === modelId,
-    );
+      ...[...keys].map(binding),
+    ].find(matches);
   }
 
   /** The delegation-model key a resolved binding is registered under, if any. */
@@ -4191,13 +4259,6 @@ Delegation rules:
           );
         }
         const startedAt = Date.now();
-        const running = this.runningDelegations().length;
-        if (running >= MAX_SUBAGENT_CONCURRENCY) {
-          return this.subagentToolError(
-            toolCallId,
-            `${MAX_SUBAGENT_CONCURRENCY} subagents are already running for this session. Wait for some with TaskWait or stop them with TaskStop before delegating more.`,
-          );
-        }
         // The delegate runs in the background (ADR 0089): `Task` returns
         // immediately with a delegation id, and TaskWait converges later.
         const resumeLookup = resume
@@ -4212,9 +4273,24 @@ Delegation rules:
         // never swap models by accident. When the recorded binding is gone the
         // run continues on the definition's current one and says so in its
         // lifecycle details, because refusing would strand the chain forever.
+        const resumeEpoch = this.turnEpoch;
         const resumedProvider = resumedChain
-          ? this.resumedChainProvider(resumedChain)
+          ? await this.resumedChainProvider(resumedChain, definition)
           : undefined;
+        if (this.disposed || this.runCancelled || this.turnHadError || resumeEpoch !== this.turnEpoch) {
+          return this.subagentToolError(toolCallId, "The parent turn ended before delegation could resume.");
+        }
+        // Authorization may yield while a parallel Task starts this chain.
+        if (resume) {
+          const current = this.resolveResumeChain(resume, definition.name);
+          if (!current.ok) return this.subagentToolError(toolCallId, current.message);
+        }
+        if (this.runningDelegations().length >= MAX_SUBAGENT_CONCURRENCY) {
+          return this.subagentToolError(
+            toolCallId,
+            `${MAX_SUBAGENT_CONCURRENCY} subagents are already running for this session. Wait for some with TaskWait or stop them with TaskStop before delegating more.`,
+          );
+        }
         if (resumedProvider) provider = resumedProvider;
         const modelChangedFrom =
           resumedChain?.latestModelId && !resumedProvider
@@ -5043,7 +5119,7 @@ Delegation rules:
   private resetDeferredToolsForPrompt(): void {
     this.activeDeferredToolNames.clear();
     this.restoreDeferredToolsFromContext();
-    this.agent.state.tools = this.activeTools();
+    this.setAgentTools(this.activeTools());
   }
 
   /**
@@ -5438,7 +5514,7 @@ Delegation rules:
     error: ReturnType<typeof classifyAgentError>,
     phase: "request" | "stream",
   ): number | undefined {
-    if (!error.retriable) return undefined;
+    if (!error.retriable || error.details?.origin === "local") return undefined;
     const infinite = this.infiniteProviderRetry;
     if (error.code === "PROVIDER_RATE_LIMITED") {
       if (
@@ -5475,6 +5551,9 @@ Delegation rules:
     providerWaitMs?: number,
     streamMs?: number,
   ): ReturnType<typeof classifyAgentError> {
+    // Local preparation never reached the provider: keep its phase and cause
+    // instead of attaching stale HTTP status or a synthetic stream phase.
+    if (error.details?.origin === "local") return error;
     const explained = withProviderFetchFailure(error, this.providerFetchFailure);
     const existingDetails = explained.details ?? {};
     const retryAttempt = error.code === "PROVIDER_RATE_LIMITED"
@@ -5670,7 +5749,7 @@ Delegation rules:
     while (messages.at(-1)?.role === "assistant") messages.pop();
     this.setAgentMessages(messages);
 
-    const promptBefore = this.agent.state.systemPrompt;
+    const promptBefore = this.agentSystemPromptContent();
     const promptWithNudge = `${promptBefore}\n\n${SILENT_TURN_NUDGE}`;
     this.setAgentSystemPrompt(promptWithNudge);
     this.silentTurnRerunInProgress = true;
@@ -5681,7 +5760,7 @@ Delegation rules:
       await this.agent.continue();
       await this.waitForIdleAndSteering();
     } finally {
-      if (this.agent.state.systemPrompt === promptWithNudge) {
+      if (this.agentSystemPromptContent() === promptWithNudge) {
         this.setAgentSystemPrompt(promptBefore);
       }
       this.applyPendingResumablePrompt();
@@ -5778,7 +5857,7 @@ Delegation rules:
     while (messages.at(-1)?.role === "assistant") messages.pop();
     this.setAgentMessages(messages);
 
-    const promptBefore = this.agent.state.systemPrompt;
+    const promptBefore = this.agentSystemPromptContent();
     const promptWithNudge = `${promptBefore}\n\n${PROGRESS_TURN_NUDGE}`;
     this.setAgentSystemPrompt(promptWithNudge);
     this.progressTurnRerunInProgress = true;
@@ -5790,7 +5869,7 @@ Delegation rules:
       await this.agent.continue();
       await this.waitForIdleAndSteering();
     } finally {
-      if (this.agent.state.systemPrompt === promptWithNudge) {
+      if (this.agentSystemPromptContent() === promptWithNudge) {
         this.setAgentSystemPrompt(promptBefore);
       }
       this.applyPendingResumablePrompt();
@@ -5808,7 +5887,7 @@ Delegation rules:
     this.compactionEnabled = compactionEnabled(settings);
     this.pendingModelCompaction = false;
     this.rebuildToolCatalog();
-    this.agent.state.tools = this.activeTools();
+    this.setAgentTools(this.activeTools());
   }
 
   private contextBudget(messages: AgentMessage[]): ContextBudget {
@@ -5820,7 +5899,11 @@ Delegation rules:
     // is bounded by `CONTEXT_CALIBRATION_FACTOR_MIN`.
     return {
       ...budget,
-      tokens: this.contextCalibration.correct(estimateContextTokens(messages)),
+      // Same target model as `contextBudgetFor` above: the calibration input
+      // must describe the request this runtime will actually send.
+      tokens: this.contextCalibration.correct(
+        estimateContextTokens(messages, this.model),
+      ),
     };
   }
 
@@ -5895,7 +5978,7 @@ Delegation rules:
     retainedUserTokens = this.retainedUserMessageBudget(budget),
     retentionMode: CompactionRetentionMode = "completed_turn",
   ) {
-    const prepared = prepareCompaction(entries, {
+    const prepared = prepareCompaction(withPiFileOpToolNames(entries), {
       enabled: this.compactionEnabled,
       reserveTokens: budget.requestHeadroom,
       keepRecentTokens: budget.keepRecentTokens,
@@ -5977,9 +6060,21 @@ Delegation rules:
     const messages = this.liveSessionContext().messages;
     const tools = this.activeTools();
     this.setAgentMessages(messages);
-    this.agent.state.tools = tools;
+    this.setAgentTools(tools);
     return {
-      messages: this.agent.state.messages,
+      // The loop owns its context array. pi appends every streamed assistant
+      // message and every tool result to the context it was handed, and its own
+      // `message_end` listener appends the same message object to
+      // `state.messages`; handing over the live array makes both land in one
+      // array, so every message of a run's later iterations is stored twice.
+      // The next turn is then built from that array, and the duplicate of an
+      // assistant message that carries text plus a tool call survives the
+      // request guard as a text-only clone sitting between the call and the
+      // result answering it. pi-ai then closes the still-pending call with a
+      // synthesized "No result provided" output next to the real one — two
+      // outputs for one call id, which the provider rejects (D620).
+      // `createContextSnapshot()` copies for the same reason.
+      messages: [...this.agent.state.messages],
       tools,
       systemPrompt: this.agent.state.systemPrompt,
     } as AgentContext;
@@ -6272,11 +6367,23 @@ Delegation rules:
     };
   }
 
+  /**
+   * Build the checkpoint a failed compaction installs: the summary it was
+   * carrying forward, a recovery notice, and the real recent window of the range
+   * it could not summarize (ADR 0049, issue #827).
+   *
+   * The window, not the notice, is what makes this checkpoint usable: with no
+   * fresh summary it is the only thing carrying the range forward, so the
+   * continuation text names it as the tail of the turn instead of presenting one
+   * leftover user line as the whole job.
+   */
   private createFallbackCheckpoint(
     preparation: ShapedPreparation,
     throughMessageId: string,
     maxSummaryChars: number,
     retentionMode: CompactionRetentionMode,
+    budget: ContextBudget,
+    failureReason: CompactionFailureReason,
   ): ContextCompactionRecord {
     const previousSummary = preparation.previousSummary
       ? boundedText(
@@ -6286,29 +6393,20 @@ Delegation rules:
       : COMPACTION_FALLBACK_NO_SUMMARY;
     const continuation =
       retentionMode === "active_turn"
-        ? "The provider is continuing the active turn. Use the one retained latest user request as the source of truth for that continuation."
-        : "The previous turn is complete. Treat this summary as historical context; the next user message is the only new task to execute.";
+        ? "The provider is continuing the active turn: the recent messages carried below are the tail of that turn and the carried summary is the older history. Continue the work they describe."
+        : "The previous turn is complete. Treat this summary and the recent messages below as historical context; the next user message is the only new task to execute.";
     const summary = [
       previousSummary,
       COMPACTION_FALLBACK_MARKER,
       "The automatic summary request did not complete. Older messages before this checkpoint are omitted from the next model request.",
       `The complete transcript remains available in the session. ${continuation}`,
     ].join("\n\n");
-    // A completed-turn checkpoint normally retains no naked user messages, but
-    // an empty tail plus a carried-forward (or absent) summary leaves the next
-    // model request with nothing before the boundary: after a runtime rebuild
-    // — model switch, restart — the session restores as if it had just started.
-    // Fall back to the newest user messages under the same budget so the
-    // failure path still restores a bounded, non-empty context (#224).
-    const retainedTail =
-      preparation.retainedTail.length > 0
-        ? preparation.retainedTail
-        : selectRetainedUserMessages(
-            preparation.messagesToSummarize.filter(
-              (message): message is UserMessage => message.role === "user",
-            ),
-            preparation.settings.keepRecentTokens,
-          );
+    const retainedTail = this.fallbackRetainedTail(
+      preparation,
+      budget,
+      maxSummaryChars,
+      retentionMode,
+    );
     return this.createCheckpoint(
       {
         ...preparation,
@@ -6321,9 +6419,47 @@ Delegation rules:
         ...this.checkpointDetails(preparation),
         fallback: "retained_tail" satisfies ContextCompactionFallback,
         failureCode: "CONTEXT_COMPACTION_FAILED",
+        failureReason,
         retainedTailMode: retentionMode,
+        // The shape tells a rebuild to replay the whole window. Without it a
+        // restored checkpoint narrows the tail back to one user message, which
+        // is the defect this window exists to fix (#827).
+        retainedTailShape: COMPACTION_RETAINED_TAIL_SHAPE,
+        retainedTailCount: retainedTail.length,
         ...this.retainedReasoningForCheckpoint(preparation),
       },
+    );
+  }
+
+  /**
+   * The recent window a fallback retains. Bounded by the keep-recent target so a
+   * failure never carries more history than a successful checkpoint would, and
+   * by what the safe budget leaves once the carried-forward summary and the
+   * recovery notice are paid for — `persistCheckpoint` re-estimates the installed
+   * context, and an oversized fallback would fail the run outright.
+   */
+  private fallbackRetainedTail(
+    preparation: ShapedPreparation,
+    budget: ContextBudget,
+    maxSummaryChars: number,
+    retentionMode: CompactionRetentionMode,
+  ): AgentMessage[] {
+    const summaryTokens = Math.ceil(maxSummaryChars / 4);
+    const available = Math.max(
+      1,
+      budget.hardLimit - summaryTokens - COMPACTION_FALLBACK_NOTICE_TOKENS,
+    );
+    const target = Math.max(
+      1,
+      Math.min(
+        budget.keepRecentTokens,
+        Math.floor(budget.hardLimit * COMPACTION_FALLBACK_KEEP_RECENT_RATIO),
+      ),
+    );
+    return selectRecentTail(
+      preparation.messagesToSummarize,
+      Math.min(target, available),
+      { latestUserGoal: retentionMode === "active_turn" },
     );
   }
 
@@ -6351,37 +6487,44 @@ Delegation rules:
     );
   }
 
+  /**
+   * Tokens one summary prompt may carry for this model window. The preflight
+   * guard and the chunk planner have to agree on it, so it is computed once here
+   * from the shared formula.
+   */
+  private summaryInputLimit(budget: {
+    hardLimit: number;
+    requestHeadroom: number;
+  }): number {
+    return compactionSummaryInputLimit({
+      hardLimit: budget.hardLimit,
+      requestHeadroom: budget.requestHeadroom,
+      modelMaxTokens: this.model.maxTokens,
+    });
+  }
+
   private compactionSummaryWouldExceedBudget(
     preparation: ShapedPreparation,
     budget: { hardLimit: number; requestHeadroom: number },
   ): boolean {
-    const contextWindow = budget.hardLimit + budget.requestHeadroom;
-    const modelOutputBudget = Math.min(
-      Math.floor(budget.requestHeadroom * 0.8),
-      Math.max(1, Math.round(this.model.maxTokens || DEFAULT_MAX_TOKENS)),
+    // The summary covers the whole boundary range, so its input is the context
+    // that tripped the hard limit. This sizes the prompt the way pi serializes
+    // it — tool results already capped — rather than the raw messages, which
+    // overstated tool-heavy sessions by several times and skipped summaries that
+    // would have fit (#543). A prompt this large is now summarized in chunks
+    // rather than skipped (#827); only the planner can still send the turn to
+    // retained-tail recovery.
+    return (
+      estimateSummaryPromptTokens(preparation) >= this.summaryInputLimit(budget)
     );
-    const summaryInputLimit = Math.max(
-      1,
-      contextWindow -
-        modelOutputBudget -
-        COMPACTION_SUMMARY_PROMPT_SAFETY_TOKENS,
-    );
-    // The summary now covers the whole boundary range, so its input is the
-    // context that tripped the hard limit. On a window whose headroom leaves
-    // less room for the summary request than the hard limit allows, this is the
-    // guard that routes the turn to retained-tail recovery instead. It sizes
-    // the prompt the way pi serializes it — tool results already capped —
-    // rather than the raw messages, which overstated tool-heavy sessions by
-    // several times and skipped summaries that would have fit (#543).
-    return estimateSummaryPromptTokens(preparation) >= summaryInputLimit;
   }
 
   /**
    * Fit the summary input under the provider budget. The full input is tried
    * first; when it is too large, one reduced pass (tool results cut to a short
-   * prefix, thinking dropped) is tried before giving up. The reduced input
-   * still covers every message the checkpoint files behind its boundary, so
-   * nothing is silently dropped from the summary's scope (ADR 0282).
+   * prefix, thinking dropped) is tried before giving up. The reduced input still
+   * covers every message the checkpoint files behind its boundary, so nothing is
+   * silently dropped from the summary's scope (ADR 0282).
    */
   private fitSummaryInputToBudget(
     preparation: ShapedPreparation,
@@ -6395,6 +6538,30 @@ Delegation rules:
       return undefined;
     }
     return reduced;
+  }
+
+  /**
+   * Plan the summary requests for a range no single prompt can carry: the
+   * reduced input when one exists, split into contiguous chunks that each fit.
+   * Returns undefined when the range cannot be planned, which is the only budget
+   * failure that still routes a turn to retained-tail recovery (#827).
+   */
+  private planSummaryRequests(
+    preparation: ShapedPreparation,
+    budget: { hardLimit: number; requestHeadroom: number },
+  ): AgentMessage[][] | undefined {
+    const reduced = reduceSummaryInput(preparation) ?? preparation;
+    const reserveTokens = Math.max(
+      Math.ceil((preparation.previousSummary?.length ?? 0) / 4),
+      compactionSummaryOutputBudget({
+        requestHeadroom: budget.requestHeadroom,
+        modelMaxTokens: this.model.maxTokens,
+      }),
+    );
+    return planSummaryChunks(reduced, {
+      summaryInputLimit: this.summaryInputLimit(budget),
+      reserveTokens,
+    });
   }
 
   private async persistCheckpoint(
@@ -6487,6 +6654,7 @@ Delegation rules:
     preparation: ShapedPreparation | undefined,
     failureMessage: string,
     retentionMode: CompactionRetentionMode,
+    failureReason: CompactionFailureReason = "summary_provider",
   ): Promise<boolean> {
     if (reason === "manual") {
       this.emitCompactionFailure(
@@ -6528,6 +6696,8 @@ Delegation rules:
         ),
       ),
       retentionMode,
+      budget,
+      failureReason,
     );
     const persisted = await this.persistCheckpoint(
       checkpoint,
@@ -6570,6 +6740,53 @@ Delegation rules:
   }
 
   /**
+   * Summarize a range whose prompt does not fit the provider window, however far
+   * it was reduced. Each chunk is one pi summary request — same prompt, retry
+   * policy, and headers as the single-pass path — and each carries the summary of
+   * the chunk before it, so the chain converges on one summary covering every
+   * message the checkpoint files behind its boundary. Only the last chunk is given
+   * the range's file operations, so the file list is appended to the summary
+   * exactly once.
+   */
+  private async generateChunkedCompaction(
+    preparation: ShapedPreparation,
+    chunks: AgentMessage[][],
+    signal: AbortSignal,
+  ): Promise<Awaited<ReturnType<typeof compact>>> {
+    let summary = preparation.previousSummary;
+    let usage: Usage | undefined;
+    let details: unknown;
+    for (const [index, messages] of chunks.entries()) {
+      const last = index === chunks.length - 1;
+      const step = await this.generateCompaction(
+        {
+          ...preparation,
+          messagesToSummarize: messages,
+          turnPrefixMessages: [],
+          isSplitTurn: false,
+          previousSummary: summary,
+          fileOps: last ? preparation.fileOps : emptyFileOps(),
+        },
+        signal,
+      );
+      if (!step.ok) return step;
+      summary = step.value.summary;
+      usage = addSummaryUsage(usage, step.value.usage);
+      if (last) details = step.value.details;
+    }
+    return {
+      ok: true,
+      value: {
+        summary: summary ?? "",
+        tokensBefore: preparation.tokensBefore,
+        usage,
+        retainedTail: preparation.retainedTail,
+        details: toJsonValue(details),
+      },
+    };
+  }
+
+  /**
    * Produce a checkpoint without touching the session: no persistence, no
    * `activeCompaction` mutation, no events. Keeping generation separate from
    * installation is what lets a failed build fall through to the retained-tail
@@ -6596,6 +6813,7 @@ Delegation rules:
         message: preparation.ok
           ? "No new context is available to compact"
           : preparation.error.message,
+        failureReason: "no_new_history",
         recoverable: true,
       };
     }
@@ -6605,7 +6823,13 @@ Delegation rules:
     }
 
     const summaryInput = this.fitSummaryInputToBudget(preparation.value, budget);
-    if (!summaryInput) {
+    // No single prompt fits. The range is summarized in chunks instead of giving
+    // up on the model: only a range that cannot be planned at all — empty, or
+    // needing more requests than the planner allows — still falls back (#827).
+    const chunks = summaryInput
+      ? undefined
+      : this.planSummaryRequests(preparation.value, budget);
+    if (!summaryInput && !chunks) {
       return {
         ok: false,
         entries,
@@ -6613,13 +6837,20 @@ Delegation rules:
         preparation: preparation.value,
         tokensBefore: preparation.value.tokensBefore,
         message: "Compaction summary input exceeds the safe model budget",
+        failureReason: "summary_budget",
         recoverable: true,
       };
     }
 
     let result: Awaited<ReturnType<typeof compact>>;
     try {
-      result = await this.generateCompaction(summaryInput, signal);
+      result = summaryInput
+        ? await this.generateCompaction(summaryInput, signal)
+        : await this.generateChunkedCompaction(
+            preparation.value,
+            chunks!,
+            signal,
+          );
     } catch (error) {
       return {
         ok: false,
@@ -6628,6 +6859,7 @@ Delegation rules:
         preparation: preparation.value,
         tokensBefore: preparation.value.tokensBefore,
         message: error instanceof Error ? error.message : String(error),
+        failureReason: "summary_provider",
         recoverable: !signal.aborted,
       };
     }
@@ -6639,6 +6871,7 @@ Delegation rules:
         preparation: preparation.value,
         tokensBefore: preparation.value.tokensBefore,
         message: result.error.message,
+        failureReason: "summary_provider",
         recoverable: result.error.code !== "aborted",
       };
     }
@@ -6752,6 +6985,7 @@ Delegation rules:
       build.preparation,
       "The checkpoint did not reduce context below the safe request budget",
       retentionMode,
+      "checkpoint_oversized",
     );
   }
 
@@ -6781,6 +7015,7 @@ Delegation rules:
         build.preparation,
         build.message,
         retentionMode,
+        build.failureReason ?? "summary_provider",
       );
     }
     return await this.installCheckpoint(build, reason, willRetry, retentionMode);
@@ -6812,15 +7047,11 @@ Delegation rules:
    * Search state transitions are low frequency, so a full frame costs less
    * than teaching every delta path about the field.
    */
-  private applyHostedSearch(message: unknown): void {
+  private applyHostedSearch(message: AssistantMessage): void {
     if (!this.currentAssistant) return;
-    const record = message as {
-      content?: unknown;
-      hostedSearchCitations?: unknown;
-    };
     const next = hostedSearchFromMessage({
-      content: record?.content,
-      citations: record?.hostedSearchCitations,
+      content: message.content,
+      citations: message.hostedSearchCitations,
     });
     if (!next) return;
     const previous = this.currentAssistant.hostedSearch;
@@ -6974,15 +7205,14 @@ Delegation rules:
           // pi-agent-core encodes stream failures in the final message
           // (stopReason "error"/"aborted" + errorMessage) and resolves the
           // prompt normally, so this is where provider/model errors surface.
-          const stopReason = (event.message as any).stopReason as
-            | string
-            | undefined;
-          const overflow = isContextOverflow(
-            event.message as AssistantMessage,
+          const stopReason = event.message.stopReason;
+          const localError = readLocalRequestErrorDetails(event.message);
+          const overflow = !localError && isContextOverflow(
+            event.message,
             effectiveModelContextWindow(this.model) || DEFAULT_CONTEXT_WINDOW,
           );
-          const failed = stopReason === "error" || overflow;
-          const aborted = stopReason === "aborted";
+          const aborted = stopReason === "aborted" || localError?.causeName === "AbortError";
+          const failed = !aborted && (stopReason === "error" || overflow);
           const errorMessage =
             failed &&
             typeof (event.message as any).errorMessage === "string" &&
@@ -7001,7 +7231,7 @@ Delegation rules:
                   retriable: false,
                 }
             : errorMessage
-              ? classifyProviderError(errorMessage, this.providerResponseStatus)
+              ? classifyProviderError(event.message, this.providerResponseStatus)
               : undefined;
           const nextText = content.hasText
             ? content.text
@@ -7029,8 +7259,8 @@ Delegation rules:
           // failed attempt cannot pair with a later usage report.
           this.recordContextCalibration(usage, failed || aborted);
           const hostedSearch = hostedSearchFromMessage({
-            content: (event.message as any).content,
-            citations: (event.message as any).hostedSearchCitations,
+            content: event.message.content,
+            citations: event.message.hostedSearchCitations,
           });
           if (hostedSearch) {
             const terminal = failed || aborted ? "failed" : "completed";
@@ -7157,7 +7387,8 @@ Delegation rules:
           const diagnosticError = classifiedError;
           const retryProviderAttempt =
             !overflow &&
-            diagnosticError !== undefined
+            diagnosticError !== undefined &&
+            diagnosticError.details?.origin !== "local"
               ? this.claimProviderRetry(diagnosticError, "stream")
               : undefined;
           if (
@@ -7502,7 +7733,9 @@ Delegation rules:
 
     // Keep every new user turn small. A capability loaded for the preceding
     // turn can be searched again when the new task actually needs it.
+    this.subagentOverrideProviders = {};
     this.resetDeferredToolsForPrompt();
+    this.refreshResumablePrompt();
     // Claims are message-scoped: a later prompt must observe edited or newly
     // created instruction files instead of reusing a previous chain.
     this.pathInstructionClaims.clear();
@@ -7589,7 +7822,9 @@ Delegation rules:
     this.runCancelled = false;
     this.turnSubagentUsage = undefined;
     // Capabilities and path-scoped instruction claims belong to one prompt.
+    this.subagentOverrideProviders = {};
     this.resetDeferredToolsForPrompt();
+    this.refreshResumablePrompt();
     this.pathInstructionClaims.clear();
     this.pendingUserMessageId = userMessageId;
     this.resetRunRecoveryState();
@@ -7639,6 +7874,10 @@ Delegation rules:
         }
       }
       await this.extensionBeforeAgentStart(modelInput);
+      if (this.runCancelled || this.disposed) {
+        this.keepPreflightUserMessage(incomingUserMessage);
+        throw turnAbortedError("Turn aborted during extension hooks");
+      }
       if (typeof modelInput === "string") {
         await this.agent.prompt(modelInput);
       } else {
@@ -7676,7 +7915,6 @@ Delegation rules:
     return { turnId: this.turnId };
   }
 
-  /** `before_agent_start` hook: extensions may replace the system prompt for this turn. */
   private async extensionBeforeAgentStart(input: string | RuntimePrompt): Promise<void> {
     const runner = this.extensionRunner;
     if (!runner) return;
@@ -7685,7 +7923,8 @@ Delegation rules:
       // Handlers edit the headers object in place, as they do in the pi CLI.
       const headers: Record<string, string> = { ...(this.provider.headers ?? {}) };
       await runner.emit("before_provider_headers", { type: "before_provider_headers", headers });
-      this.extensionProviderHeaders = headers;
+      if (this.runCancelled || this.disposed) return;
+      this.extensionProviderHeaders = { ...headers };
     }
     if (!runner.hasHandlers("before_agent_start")) return;
     const base = this.composeSystemPrompt();
@@ -7831,6 +8070,7 @@ Delegation rules:
     this.acceptingSteering = false;
     this.gracefulStopRequested = false;
     this.runCancelled = true;
+    this.extensionRunner?.cancelPending();
     this.resolvePendingAskTools();
     this.abortRunningDelegations();
     this.turnSubagentUsage = undefined;
@@ -7868,9 +8108,10 @@ Delegation rules:
   }
 
   async dispose(): Promise<void> {
+    if (this.disposed) return;
     const runner = this.extensionRunner;
     this.extensionRunner = undefined;
-    if (runner) await runner.dispose().catch(() => undefined);
+    const closingExtensions = runner?.dispose();
     // An outstanding provider request belongs to this session: abort it before
     // the runtime is gone, so its result is discarded rather than delivered to
     // a session whose runtime was replaced (plan D8).
@@ -7899,5 +8140,6 @@ Delegation rules:
     this.cleanupActiveToolProgress();
     if (this.compactionInProgress) this.compactionAborted = true;
     this.compactionAbort?.abort();
+    await closingExtensions;
   }
 }

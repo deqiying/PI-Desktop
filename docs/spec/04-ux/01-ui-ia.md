@@ -221,6 +221,10 @@ destination, chat as the home surface, tools and permissions inline.
   delete remain separate actions. Rename edits the task label only; archive
   never removes the transcript. Open folder is a project action, not a
   conversation action.
+- **Temporary-task attachments**: selecting a saved attachment opens its file
+  preview even without an open project. Back returns to the no-project browsing
+  state. Branches preserve referenced pasted/imported inputs as child-owned
+  copies; deleting the source task does not break these previews.
 - **Sort**: user-facing modes are Recently updated, Created date, Oldest
   first, and Name. Pinned rows precede unpinned rows. Project groups switch
   to `manual` by dragging a title or using ArrowUp/ArrowDown on that

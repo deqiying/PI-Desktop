@@ -160,7 +160,7 @@ plugin runtime
 
 受信任扩展的 provider 访问**不**是 `HOST_API_ALLOWLIST` 条目：它属于 sidecar 宿主代理
 （规格 16 §10.1），且只能从 `contributes.agentExtensions` 模块到达，因此沙箱化的插件面
-仍然无法发出 provider 请求（ADR 0301）。它的审计行走同一个 `plugin.api` 汇聚点，写入的
+仍然无法发出 provider 请求（ADR 0305）。它的审计行走同一个 `plugin.api` 汇聚点，写入的
 操作名是 `models.list`（每次目录读取或拒绝一条，携带行数）和 `provider.request`（每次
 调用一条，携带方法、状态、耗时、文件数和字节大小 —— 永不含路径、请求头值、字段值或
 凭据）。两者都会点出会话和贡献插件的 id，因此被拒绝的调用和失败的调用可以互相比较。

@@ -176,7 +176,7 @@ main、渲染层或插件宿主进程中。
 `refresh()` 重新拉取快照。PI 未实现的所有上游成员——`getProvider`、`getError`、
 `isUsingOAuth`、`getApiKeyAndHeaders`、`getApiKeyForProvider`、`getProviderAuth`、
 `complete`、`stream`、`streamSimple`，以及注册系列——都存在、返回其文档化的中性值，
-并按扩展、按成员各产生一条诊断（ADR 0300）。插件自有的 provider 保留其原有答案：
+并按扩展、按成员各产生一条诊断（ADR 0304）。插件自有的 provider 保留其原有答案：
 其认证状态报告为已配置且 `source: "runtime"`，其显示名是插件 agent 的名称，
 且 `hasConfiguredAuth` 对它返回 true。main 不拥有的会话 id 会在任何目录读取之前被拒绝。
 
@@ -187,7 +187,7 @@ main、渲染层或插件宿主进程中。
 `/chat/completions`、`/images/generations`、`/embeddings`，或该 provider 暴露的
 任何其他路径。Host 只贡献三样东西，且不含任何协议特定内容 —— 目标 origin、凭据和
 传输策略。它按调用方的要求组装信封，却从不解释它，不知道流式，也不把 provider
-响应映射成 PI 类型（ADR 0301）。
+响应映射成 PI 类型（ADR 0305）。
 
 | 输入 | 契约 |
 |---|---|
@@ -288,9 +288,9 @@ HTTP 状态是结果，不是错误码；被拒绝的文件路径、上限或分
 | `session_info_changed` | 经 `setSessionName` 的会话改名 | 否 |
 | `project_trust` | v1 说明：不触发；按项目启用即信任决定 | 否 |
 | `resources_discover` | v1 说明：不触发；skills 与提示发现留在 Electron main | 不适用 |
-| `before_agent_start` | 回合内首个 provider 请求之前 | 是，系统提示与消息编辑 |
+| `before_agent_start` | 回合内首个 provider 请求之前 | 是，仅替换系统提示词 |
 | `context` | `prepareNextTurn` | 是，替换消息列表 |
-| `before_provider_request`、`before_provider_headers`、`after_provider_response` | provider 调用包装 | 请求与头部为是 |
+| `before_provider_request`、`before_provider_headers`、`after_provider_response` | provider 调用包装 | 请求采纳返回值；头部原地修改 payload |
 | `agent_start`、`agent_end`、`agent_settled` | Agent 循环边界 | 否 |
 | `turn_start`、`turn_end` | 回合边界 | 否 |
 | `message_start`、`message_update`、`message_end` | Agent 消息事件 | v1 说明：否，pi-agent-core 不提供事后替换 |
@@ -303,8 +303,37 @@ HTTP 状态是结果，不是错误码；被拒绝的文件路径、上限或分
 | `input` | v1 说明：不触发；Host 队列准入尚未接入 | 不适用 |
 | `user_bash`、`session_before_switch`、`session_before_tree`、`session_tree`、`ui_prompt_start`、`ui_prompt_end` | v1 不触发 | 不适用 |
 
-抛出异常的处理器记为诊断并视为返回 `undefined`。带返回结果的事件若处理器超过
-30 秒，则放弃并记诊断，回合以未修改的值继续。
+Desktop 事件能力由 `packages/agent-runtime/src/extensions/event-capabilities.ts`
+维护，分为返回值、原地修改、通知和未接通。未接通事件仍可注册，但会在现有插件诊断中
+显示 `unsupported_api`，不妨碍其他已支持的处理器加载。
+
+所有事件处理器（包括启动、关闭和通知）均有每个处理器 30 秒的等待上限。模块加载和
+工厂初始化分别有 30 秒上限，失败归入加载或工厂诊断。处理器异常或超时记诊断并视为
+返回 `undefined`，后续处理器按注册顺序继续。既有结果归并和失败继续策略保持不变，
+不能将其作为强制安全检查。多个挂起处理器可能分别耗尽各自的时间预算。
+
+中止会使等待中的事件派发失效。销毁先拒绝新派发并取消已有等待，再执行关闭处理器；
+并发销毁只关闭一次。旧派发不返回结果、不再执行剩余处理器，迟到的完成或异常不会覆盖
+结果或增加诊断。销毁后完成的工厂不能发布工具和命令。Runtime 在等待扩展关闭前先停止
+Agent 工作。在请求前 hook 等待期间停止，不会继续请求模型，并保留用户消息；之后可正常
+发送下一条消息。
+
+每次调用拥有独立的 `ctx.signal`，完成、超时、Stop 或销毁后失效。旧回调再调用 SDK
+会被拒绝，包括等待空闲、创建会话、fork 和发送消息的后续步骤。已提交给 Host 的事务
+不回滚，但迟到返回不再触发队列优先级更新或修改 Runtime 模型状态。命令与工具不套用
+事件的 30 秒上限，可运行至完成、传入信号取消、Stop 或销毁；迟到的工具进度和结果被丢弃。
+已采纳的工具进度和结果会先复制再发布，扩展之后的原地修改不能改写它们。`pi.exec`
+创建的进程树随作用域退出或显式超时终止，销毁等待已登记进程清理并报告失败。
+主动逃离进程组或通过 Node API 直接创建的进程不在此所有权范围。
+
+带返回值的 Hook 输入输出使用独立副本，头部修改仅在处理器及时成功后提交。
+迟到的原地修改不会影响宿主或下一处理器。UI 请求按请求 ID、会话和扩展身份取消，
+排队请求被丢弃，已显示的弹窗向渲染层发送精确退役通知；旧取消不会关闭新请求。
+
+这些是协作式生命周期约束，不是强制执行隔离：可信代码仍可同步阻塞 JS 或直接使用
+Node API 产生外部副作用。Native Pi 会话由上游 SDK 管理，不属于本次 Desktop 变更。
+事件处理器等待 UI 提示时也受 30 秒限制，
+UI broker 自身的提示超时不会延长该预算。
 
 ## 7. 工具
 
@@ -361,8 +390,8 @@ v1 不改任何 host-core RPC 方法、协议版本或 SQLite schema。
 | `extensions.diagnostics.publish` | 替换会话的诊断列表 |
 | `extensions.model.configure` | 校验插件自有的 provider/模型绑定，经 `session.configure` 持久化，然后广播 `session:modelChanged` |
 | `session.rename`、`session.create`、`session.fork`、`session.queuePush`、`session.queuePrioritize` | 已有方法，现可从适配层到达 |
-| `extensions.providers.list` | 把就绪宿主模型目录投影给会话的扩展，由 `models.list` 门控（ADR 0300） |
-| `extensions.providers.request` | 一次带认证的 provider 请求，由 `provider.request` 把关；以 HTTP 结果或带错误码的失败作答（ADR 0301） |
+| `extensions.providers.list` | 把就绪宿主模型目录投影给会话的扩展，由 `models.list` 门控（ADR 0304） |
+| `extensions.providers.request` | 一次带认证的 provider 请求，由 `provider.request` 把关；以 HTTP 结果或带错误码的失败作答（ADR 0305） |
 | `extensions.providers.abort` | 按 `(sessionId, callId)` 取消在途请求；由传输层作答，不作为请求记入审计 |
 
 ### 10.2 main ↔ 渲染层（Electron IPC）
@@ -398,7 +427,7 @@ main 在 `logs/app/plugin.log` 审计每个提示 id。
 |---|---|---|
 | v1 | loader、每会话 Runner、支持矩阵、事件、工具、命令、UI 桥接 | 已交付（D387） |
 | v1.1 | 模块成为带 `agent.extension` 授权的 `contributes.agentExtensions`；把 pi CLI 扩展导入为开发插件；独立注册表和设置标签移除 | 已交付（D388） |
-| v1.1 修订 | 受信任扩展的 provider 访问：由 `models.list` 门控的就绪模型投影，以及面向具名 provider 行发出一次带认证请求的 `provider.request` 面 | 已实现（ADR 0300 / ADR 0301） |
+| v1.1 修订 | 受信任扩展的 provider 访问：由 `models.list` 门控的就绪模型投影，以及面向具名 provider 行发出一次带认证请求的 `provider.request` 面 | 已实现（ADR 0304 / ADR 0305） |
 | v2 | 自定义会话条目（`sendMessage`、`appendEntry`）含 schema 升版和通用渲染、`sessionManager` 只读 shim、`switchSession`、编辑器读写、补全 provider、`registerShortcut`、markdown 转换器 | 已规划，需先决定条目持久化与压缩 |
 | v2 | 自定义会话条目（`sendMessage`、`appendEntry`）与一次 schema 升级及通用渲染层、`sessionManager` 只读 shim、`switchSession`、编辑器读写、自动补全 provider、`registerShortcut`、markdown 转换器 | 计划中，需要就条目持久化与压缩作出决定 |
 | v3 | `pi` 包 manifest 与安装、pi CLI `settings.json` 的只读提示、统一 skill 与提示发现、提示的远程控制路由、市场列出 | 未排期 |
@@ -412,8 +441,8 @@ v1 交付顺序：打包 spike（E2E-245）、shared 协议类型，然后运行
 - 一组覆盖每个受支持成员的样例扩展在每次升级时作为契约测试运行。
 - 新增的 `ExtensionAPI` 成员先落入“不支持”类别并产生诊断，直到后续决策
   移动它们。成员只在记录该决策的同一次变更中转为受支持：`modelRegistry` 及其目录
-  投影由 ADR 0300 移动，`provider.request` 执行面及其 `provider.request` 授权由
-  ADR 0301 移动。
+  投影由 ADR 0304 移动，`provider.request` 执行面及其 `provider.request` 授权由
+  ADR 0305 移动。
 - 对外文档只承诺 §5 中“支持”和“上下文上支持”两个类别。
 
 ## 14. 待决事项

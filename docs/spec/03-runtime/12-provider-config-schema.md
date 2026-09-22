@@ -136,6 +136,11 @@ models.dev snapshot. Unknown free-form models initially expose
 `supportsReasoning=false` and `supportedThinkingLevels=["off"]`; Settings may
 still persist an explicit thinking-level binding for an endpoint that supports
 it. The raw secret and internal compatibility JSON remain hidden.
+A hand-typed custom model id is matched against that snapshot before its
+binding is seeded (`providers.lookupModel`, §9), so a published record supplies
+the binding's context window, max output tokens, and thinking levels even
+though the id is absent from every discovered list; an unpublished id keeps the
+generic seed.
 
 Anthropic Messages providers may store either the service root or a URL ending
 in `/v1`. Model discovery preserves that configured path and requests
@@ -432,6 +437,7 @@ change for the raw snapshot.
 - `providers.delete`
 - `providers.testConnection`
 - `providers.listModels`
+- `providers.lookupModel`
 - `providers.cacheModels` (internal Electron-main to host persistence bridge)
 - `providers.refreshModels`
 - `providers.upsertUserModel`
@@ -537,11 +543,33 @@ The canonical DDL lives in [04-data-storage](04-data-storage.md) (D086). Summary
   Copilot account lists what its subscription includes) instead of calling
   `/models`; each returned model carries the apiStyle its wire API implies.
   Static vendors such as `openai-codex` use the pinned pi-ai catalog (0.86.1
-  includes `gpt-6-astra`); models.dev does not invent those IDs.
+  includes `gpt-6-astra`); models.dev does not invent those IDs. `xai` is the
+  exception: conversation models come from `GET /v1/models` on the resolved
+  account token, and the pinned catalog is used only when that request fails.
 - out: `{ models: ModelCatalogItem[] }`; each known model carries the complete
   models.dev metadata including `reasoning`, `supportedThinkingLevels`, limits,
   modalities, output types, and capability tags. Cached/provider claims cannot
   override the local catalog record.
+
+### `providers.lookupModel`
+- renderer IPC in: `{ modelId, baseUrl?, providerId?, vendorKey? }`
+- out: `{ info: ModelInfo | null }`
+- reads only the local models.dev snapshot: `ensureLoaded` then `findModel`,
+  with no provider network access and no host RPC. `vendorKey` and `baseUrl`
+  only disambiguate which published provider owns a duplicate id; `providerId`
+  is echoed back on the returned record for the settings surface.
+- exists because `providers.listModels` only describes a saved or reached
+  provider's catalogue: a hand-typed custom id has no other channel to its
+  published limits before the provider is saved.
+- a hit seeds the new binding exactly like a picked model
+  (`bindingFromModelInfo`): published context window, max output tokens, and
+  thinking levels, with `contextWindowSource: "catalog"`, while the stored id
+  stays exactly what the user typed (`bindingForCustomModelInfo`). A miss
+  (`null`) keeps today's behavior: the picker seeds the custom binding with the
+  generic 128,000 / 8,192 defaults and no thinking levels
+  (`bindingForCustomModel`). The row is written first and upgraded in place, so
+  a slow, failed, or unpublished lookup still leaves exactly one usable row and
+  never overwrites an edit or delete made while it was in flight.
 
 ### `providers.cacheModels` (internal host RPC)
 - in: `{ providerId, models: DiscoveredModelInput[] }`

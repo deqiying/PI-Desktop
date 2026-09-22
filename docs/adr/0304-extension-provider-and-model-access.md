@@ -1,4 +1,4 @@
-# ADR 0300: Trusted-extension provider and model access
+# ADR 0304: Trusted-extension provider and model access
 
 - Status: Accepted for implementation
 - Date: 2026-09-21

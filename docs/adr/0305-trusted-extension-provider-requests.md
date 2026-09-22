@@ -1,15 +1,15 @@
-# ADR 0301: Trusted-extension provider requests
+# ADR 0305: Trusted-extension provider requests
 
 - Status: Accepted for implementation
 - Date: 2026-09-21
 - Deciders: PI-Desktop core
-- Amends: ADR 0300 (adds the execution member that record deferred)
+- Amends: ADR 0304 (adds the execution member that record deferred)
 - Related: ADR 0134, ADR 0174 (D336), ADR 0258 (decision 4), spec 16 §5 / §10.1 /
   §13, spec 12 §6.1 / §8, spec 13, spec 03 §4 / §5, spec 03 §11
 
 ## Context
 
-ADR 0300 landed the information surface: a plugin can now discover the user's
+ADR 0304 landed the information surface: a plugin can now discover the user's
 ready providers and models and read truthful auth availability. It deliberately
 deferred execution. The reported use case needs more: an authenticated request to
 a path the plugin chooses on a provider the user configured, so a plugin can
@@ -72,7 +72,7 @@ record.
 7. **A new high-risk grant `provider.request` gates the member**, registered in
    every copy of the permission list, shown at install time, and audited per call.
    Subject resolution, the union-of-grants rule, and the "main-owned state only"
-   rule are those of ADR 0300.
+   rule are those of ADR 0304.
 8. **Brakes and budgets.** Eight requests per rolling 60 s per plugin, sharing the
    counter the plugin host already uses for `agent.complete`; four requests in
    flight per plugin; a 60 s default per-call budget with an explicit maximum of
@@ -85,7 +85,7 @@ record.
    method, and clears the entry when the call settles — on success, on failure, on
    runtime disposal, and on session switch.
 10. **Three allowlisted host-proxy methods**: `extensions.providers.list` (ADR
-    0300), `extensions.providers.request`, and `extensions.providers.abort`. The
+    0304), `extensions.providers.request`, and `extensions.providers.abort`. The
     request method carries the claimed `extensionId` for audit attribution only.
 
 ## Consequences
@@ -99,7 +99,7 @@ record.
   exfiltration and not SSRF.
 - The brake is a brake, not a security boundary, and the sidecar still runs every
   module of a session in one process: with several contributing plugins, a module
-  can use a sibling's grant (ADR 0300's residual limit). Per-extension isolation
+  can use a sibling's grant (ADR 0304's residual limit). Per-extension isolation
   would need a separate process or module scope, which spec 16 §4.3 does not
   provide.
 - The upload containment constrains what the host resolves on the caller's behalf.

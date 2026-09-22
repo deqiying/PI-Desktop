@@ -149,6 +149,9 @@ models.dev 快照，之后的目录修正可以替换它；`user` 表示用户�
 代替模型记录。未知的自由形式模型暴露了 `supportsReasoning=false`
 和 `supportedThinkingLevels=["off"]`。原始秘密和内部兼容性
 JSON 保持隐藏状态。
+手输的自定义模型 id 会在写入绑定前先与该快照匹配（`providers.lookupModel`，§9）：
+即使该 id 不在任何已发现的列表中，已发布的记录也会提供绑定的上下文窗口、最大输出
+token 与思考等级；未发布的 id 仍沿用通用种子值。
 
 `authKind: "oauth"` 标记厂商账户行（ADR 0095、D237）：其凭据是保存在
 `secret:provider:<id>:oauth` 下的 OAuth 授权，而不是粘贴的密钥，因此该行
@@ -299,6 +302,7 @@ Copilot 的上下文相关请求标头；已保存的同名自定义 header 会�
 - `providers.delete`
 - `providers.testConnection`
 - `providers.listModels`
+- `providers.lookupModel`
 - `providers.cacheModels`（内部 Electron-main 到主机持久桥）
 - `providers.refreshModels`
 - `providers.upsertUserModel`
@@ -394,6 +398,20 @@ Copilot 的上下文相关请求标头；已保存的同名自定义 header 会�
 - 输出：`{ models: ModelCatalogItem[] }`；每个模型都带有 pi-resolved
   `reasoning` 功能和 `supportedThinkingLevels`。缓存的功能标签
   旧提供程序字段无法覆盖 pi 模型记录。
+
+### `providers.lookupModel`
+- 渲染器 IPC 入参：`{ modelId, baseUrl?, providerId?, vendorKey? }`
+- 输出：`{ info: ModelInfo | null }`
+- 只读取本地 models.dev 快照：先 `ensureLoaded` 再 `findModel`，不访问提供商网络，
+  也不调用主机 RPC。`vendorKey` 与 `baseUrl` 仅用于在重复 id 之间消歧归属的发布提供
+  商；`providerId` 会回显在返回记录上供设置界面使用。
+- 需要它是因为 `providers.listModels` 只描述已保存或已探测提供商的目录：手输的自定义
+  id 在提供商保存前没有别的通道取得其已发布限额。
+- 命中时按拾取模型的口径（`bindingFromModelInfo`）为这条绑定播种：已发布的上下文窗口、
+  最大输出 token 与思考等级，并标记 `contextWindowSource: "catalog"`；存储的 id 仍是
+  用户输入的那个（`bindingForCustomModelInfo`）。未命中（`null`）保持今天的行为：按
+  通用 128,000 / 8,192 与空思考等级播种（`bindingForCustomModel`）。行先落下再原地升级，
+  因此查询慢、失败或未发布时仍然只留一行可用记录，且不会覆盖期间发生的编辑或删除。
 
 ### `providers.cacheModels`（内部主机 RPC）
 - 在：`{ providerId, models: DiscoveredModelInput[] }`

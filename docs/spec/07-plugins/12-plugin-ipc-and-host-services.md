@@ -180,7 +180,7 @@ audit-operation names for the device service: `audio.input.open` /
 Trusted-extension provider access is **not** a `HOST_API_ALLOWLIST` entry: it
 belongs to the sidecar host proxy (spec 16 §10.1) and is reachable only from
 `contributes.agentExtensions` modules, so the sandboxed plugin surface stays
-unable to issue provider requests (ADR 0301). Its audit rows use the same
+unable to issue provider requests (ADR 0305). Its audit rows use the same
 `plugin.api` sink and are written for the operation names `models.list` (one row
 per catalogue read or refusal, carrying the row count) and `provider.request`
 (one row per call, carrying the method, status, duration, file count, and byte

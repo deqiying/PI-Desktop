@@ -300,7 +300,7 @@ project the same ready set. Reads are synchronous from the snapshot, and
 `getProvider`, `getError`, `isUsingOAuth`, `getApiKeyAndHeaders`,
 `getApiKeyForProvider`, `getProviderAuth`, `complete`, `stream`, `streamSimple`,
 and the registration family — exists and returns its documented neutral value
-with one diagnostic per extension per member (ADR 0300). A plugin-owned provider
+with one diagnostic per extension per member (ADR 0304). A plugin-owned provider
 keeps its previous answers: its auth status reports configured with
 `source: "runtime"`, its display name is the plugin agent's name, and
 `hasConfiguredAuth` returns true for it. A session id main does not own is
@@ -315,7 +315,7 @@ caller supplies the path, so the same member reaches `/chat/completions`,
 The Host contributes exactly three things and nothing protocol-specific — the
 destination origin, the credential, and the transport policy. It assembles the
 envelope the caller asked for but never interprets it, does not know about
-streaming, and does not map provider responses into PI types (ADR 0301).
+streaming, and does not map provider responses into PI types (ADR 0305).
 
 | Input | Contract |
 |---|---|
@@ -435,9 +435,9 @@ are honored where the event type defines a result.
 | `session_info_changed` | Session rename through `setSessionName` | No |
 | `project_trust` | v1 note: not emitted; enablement per project is the trust decision | No |
 | `resources_discover` | v1 note: not emitted; skills and prompt discovery stay in Electron main | n/a |
-| `before_agent_start` | Before the first provider request of a turn | Yes, system prompt and message edits |
+| `before_agent_start` | Before the first provider request of a turn | Yes, system prompt replacement only |
 | `context` | `prepareNextTurn` | Yes, replacement message list |
-| `before_provider_request`, `before_provider_headers`, `after_provider_response` | Provider call wrapper | Yes for request and headers |
+| `before_provider_request`, `before_provider_headers`, `after_provider_response` | Provider call wrapper | Request return value; headers mutate the payload in place |
 | `agent_start`, `agent_end`, `agent_settled` | Agent loop boundaries | No |
 | `turn_start`, `turn_end` | Turn boundaries | No |
 | `message_start`, `message_update`, `message_end` | Agent message events | v1 note: no, pi-agent-core offers no post-hoc replacement |
@@ -450,9 +450,54 @@ are honored where the event type defines a result.
 | `input` | v1 note: not emitted; Host queue admission is not wired yet | n/a |
 | `user_bash`, `session_before_switch`, `session_before_tree`, `session_tree`, `ui_prompt_start`, `ui_prompt_end` | Not emitted in v1 | n/a |
 
-A handler that throws is logged as a diagnostic and treated as returning
-`undefined`. A handler that exceeds 30 s for a result-bearing event is
-abandoned with a diagnostic and the turn proceeds with the unmodified value.
+Desktop event capabilities are maintained in
+`packages/agent-runtime/src/extensions/event-capabilities.ts`: result,
+mutation, notification, or deferred. Registering a deferred event remains
+accepted but emits an `unsupported_api` diagnostic in the existing plugin
+diagnostics; it does not prevent supported handlers from loading.
+
+Every event handler, including startup, shutdown, and notifications, has a
+30-second **per-handler** wait budget. Module loading and factory initialization
+also have separate 30-second wait budgets, reported as load/factory errors.
+A handler that throws or times out produces a diagnostic and counts as
+`undefined`; subsequent handlers still run in registration order. Existing
+result folding and fail-open semantics are unchanged. This is not a mandatory
+security-check mechanism. Multiple stalled handlers can each consume their budget.
+
+Abort retires pending event dispatches. Disposal first rejects new dispatches
+and cancels existing waits, then runs shutdown once even under concurrent
+disposal. Old dispatches return no result and never invoke their remaining
+handlers; late settlements do not add diagnostics or overwrite results. A
+factory finishing after disposal cannot publish tools or commands. Runtime
+shutdown cancels agent work before waiting for extension shutdown. Stopping
+during preflight hooks prevents the provider request and retains the user
+message; a later prompt can run normally.
+
+Each invocation now owns an abort signal exposed as `ctx.signal`. Finishing,
+timing out, stopping or disposing retires that invocation. SDK calls from its
+late callbacks are rejected, including commands waiting for idle, session creation,
+fork or queue admission. An already admitted Host transaction is not rolled back;
+late completion cannot start a subsequent queue-priority update or mutate runtime
+model state. Commands and tool executions have no event-style 30-second limit:
+they may run until completion, their supplied signal aborts, Stop, or disposal.
+Tool updates/results after retirement are discarded; accepted updates and results
+are detached before publication so later extension mutations cannot rewrite them.
+SDK `exec` owns its process group/tree and terminates it on scope retirement or
+its explicit timeout;
+disposal waits for tracked process cleanup, with cleanup failures diagnosed.
+Processes deliberately escaping the group and direct Node API spawns are outside
+this ownership contract.
+
+Result-bearing hook inputs and outputs are detached copies. Header mutations
+are committed only after a handler succeeds within its budget. Late in-place
+mutations cannot alter the caller's payload or another handler's input.
+
+These are cooperative lifecycle boundaries, not forced execution isolation:
+trusted code may still block the JS thread or use direct Node APIs for external
+side effects. Native Pi sessions use the upstream SDK lifecycle and are outside
+this Desktop change. See ADR `trusted-extension-operation-ownership`.
+The 30-second event budget also applies when a handler waits for a UI prompt;
+the UI broker's own prompt timeout does not extend that budget.
 
 ## 7. Tools
 
@@ -502,6 +547,11 @@ Rules:
 - One pending interactive prompt per session. A second call queues behind
   the first.
 - Aborting the turn cancels pending prompts with the abort values above.
+- Every new sidecar UI request has an invocation-owned request ID. Cancellation
+  targets that ID plus the session/extension identity, drops queued requests,
+  and sends retirement for the exact visible prompt to the renderer. Stale
+  cancellation cannot close a later request. Legacy requests without IDs retain
+  session-wide cancellation. Settled queue tails are released.
 - Under remote control (Post-MVP) the prompt fails immediately with
   `UNSUPPORTED` until the remote protocol routes it; that routing is v3.
 - Prompts show the extension label and source path so the user knows who is
@@ -520,8 +570,8 @@ No host-core RPC method, protocol version, or SQLite schema changes in v1.
 | `extensions.diagnostics.publish` | Replace the session's diagnostics list |
 | `extensions.model.configure` | Validate and persist a plugin-owned provider/model binding through `session.configure`, then broadcast `session:modelChanged` |
 | `session.rename`, `session.create`, `session.fork`, `session.queuePush`, `session.queuePrioritize` | Existing methods, now reachable from the adapter |
-| `extensions.providers.list` | Project the ready host-model catalogue to the session's extensions, gated by `models.list` (ADR 0300) |
-| `extensions.providers.request` | One authenticated provider request, gated by `provider.request`; answers with the HTTP result or a coded failure (ADR 0301) |
+| `extensions.providers.list` | Project the ready host-model catalogue to the session's extensions, gated by `models.list` (ADR 0304) |
+| `extensions.providers.request` | One authenticated provider request, gated by `provider.request`; answers with the HTTP result or a coded failure (ADR 0305) |
 | `extensions.providers.abort` | Cancel an in-flight request by its `(sessionId, callId)`; answered by the transport, not audited as a request |
 
 ### 10.2 Main ↔ renderer (Electron IPC)
@@ -561,7 +611,7 @@ The Plugins page shows agent extensions on the owning plugin's row:
 | v1 | Loader, Runner per session, support matrix, events, tools, commands, UI bridge | Shipped (D387) |
 | v1.1 | Modules become `contributes.agentExtensions` with the `agent.extension` grant; import of pi CLI extensions as development plugins; the standalone registry and settings tab are removed | Shipped (D388) |
 | v1.1 amendment | Plugin-owned custom agents via `registerAgent`, provider compatibility alias, redacted model registry, idle-only session binding and restore through `extension-agent:` ids | Implemented (D426 / ADR 0258) |
-| v1.1 amendment | Trusted-extension provider access: the ready-model projection gated by `models.list`, and the `provider.request` surface for one authenticated request to a named provider row | Implemented (ADR 0300 / ADR 0301) |
+| v1.1 amendment | Trusted-extension provider access: the ready-model projection gated by `models.list`, and the `provider.request` surface for one authenticated request to a named provider row | Implemented (ADR 0304 / ADR 0305) |
 | v2 | Custom session entries (`sendMessage`, `appendEntry`) with a schema bump and a generic renderer, `sessionManager` read shim, `switchSession`, editor read and write, autocomplete providers, `registerShortcut`, markdown transformers | Planned, needs a decision on entry persistence and compaction |
 | v3 | `pi` package manifests and installation, read-only hints from the pi CLI's `settings.json`, unified skill and prompt discovery, remote-control routing for prompts, marketplace listing | Not scheduled |
 
@@ -576,8 +626,8 @@ runtime, main, and renderer tracks in parallel.
 - New `ExtensionAPI` members land in the Unsupported class with a
   diagnostic until a later decision moves them. A member becomes supported only
   in the change that records that decision: `modelRegistry` and its catalogue
-  projection moved by ADR 0300, and the `provider.request` execution surface
-  with the `provider.request` grant by ADR 0301.
+  projection moved by ADR 0304, and the `provider.request` execution surface
+  with the `provider.request` grant by ADR 0305.
 - Public documentation promises only the Supported and Supported-on-context
   classes in §5.
 
