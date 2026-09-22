@@ -398,16 +398,32 @@ export async function check(dirInput: string): Promise<CheckResult> {
   }
 
   // Entry-source hints: a declared permission that the code never exercises is
-  // a needless prompt for the user, and the reverse is a runtime denial.
-  const mainSource = await readFile(join(dir, manifest.main), "utf8").catch(() => "");
-  if (mainSource) {
+  // a needless prompt for the user, and the reverse is a runtime denial. A
+  // trusted extension calls the host API from its `agentExtensions` module
+  // rather than the plugin entry, so both are scanned before warning.
+  const hintSources = [
+    manifest.main,
+    ...(manifest.contributes?.agentExtensions ?? []),
+  ].filter((path): path is string => typeof path === "string" && path.length > 0);
+  const scanned = (
+    await Promise.all(
+      hintSources.map((path) =>
+        readFile(join(dir, path), "utf8")
+          .then((text) => ({ path, text }))
+          .catch(() => null),
+      ),
+    )
+  ).filter((entry): entry is { path: string; text: string } => entry !== null);
+  if (scanned.length) {
+    const source = scanned.map((entry) => entry.text).join("\n");
+    const named = scanned.map((entry) => entry.path).join(" / ");
     for (const permission of permissions) {
       const apis = PERMISSION_API_HINTS[permission];
       if (!apis) continue;
-      if (!apis.some((api) => mainSource.includes(api))) {
+      if (!apis.some((api) => source.includes(api))) {
         warnings.push({
           code: "permission.unused",
-          message: `permission "${permission}" is declared but ${manifest.main} never calls ${apis.join(" / ")}`,
+          message: `permission "${permission}" is declared but ${named} never calls ${apis.join(" / ")}`,
         });
       }
     }
