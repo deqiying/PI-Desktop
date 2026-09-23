@@ -91,6 +91,18 @@ export async function turnProcessProbe() {
     assert(element, "missing click target");
     flushSync(() => element.click());
   };
+  /**
+   * A computed colour for a design token, so the tone assertions describe the
+   * token instead of a literal value taken from one theme.
+   */
+  const tokenColor = (token: string) => {
+    const probe = document.createElement("span");
+    probe.style.color = `var(${token})`;
+    document.body.append(probe);
+    const value = getComputedStyle(probe).color;
+    probe.remove();
+    return value;
+  };
   const intro = message("intro", "assistant", "Inspecting the files", {
     thinking: "reasoning detail",
     status: "complete",
@@ -229,6 +241,58 @@ export async function turnProcessProbe() {
     check(
       visible(container.querySelector('[data-message-id="failure"]')),
       "failure remains visible",
+    );
+
+    /*
+      Interim narration: a trailing candidate that is still streaming while the
+      turn already shows earlier work reads at the process indentation and in
+      the process tone, and drops that presentation once it settles. Both tones
+      are read from the design tokens rather than from literal colours.
+    */
+    const processTone = tokenColor("--ds-text-secondary");
+    const answerTone = tokenColor("--ds-text-primary");
+    const narration = message("narration", "assistant", "Checking the log", {
+      status: "streaming",
+    });
+    render([intro, read, narration], true, null, "interim", true);
+    const narrationBubble = container.querySelector<HTMLElement>(
+      '[data-message-id="narration"]',
+    );
+    const narrationProse = narrationBubble?.querySelector<HTMLElement>(".prose-chat");
+    const processProse = container.querySelector<HTMLElement>(
+      ".turn-process-body .assistant-turn-fragment .prose-chat",
+    );
+    assert(narrationBubble && narrationProse && processProse, "the narration did not render");
+    check(
+      narrationBubble.classList.contains("interim"),
+      "a running turn presents its streaming candidate as interim narration",
+    );
+    check(
+      getComputedStyle(narrationProse).color === processTone,
+      "interim narration reads in the process tone",
+    );
+    check(
+      getComputedStyle(processProse).color === processTone,
+      "process narration reads in the process tone",
+    );
+    render(
+      [intro, read, { ...narration, status: "complete" as const }],
+      false,
+      null,
+      "interim-done",
+    );
+    const settledBubble = container.querySelector<HTMLElement>(
+      '[data-message-id="narration"]',
+    );
+    const settledProse = settledBubble?.querySelector<HTMLElement>(".prose-chat");
+    assert(settledBubble && settledProse, "the settled answer did not render");
+    check(
+      !settledBubble.classList.contains("interim"),
+      "the interim presentation is dropped once the message settles",
+    );
+    check(
+      getComputedStyle(settledProse).color === answerTone,
+      "a settled answer keeps the answer tone",
     );
 
     flushSync(() =>

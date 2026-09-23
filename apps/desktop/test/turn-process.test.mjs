@@ -4,6 +4,7 @@ import test from "node:test";
 register(new URL("./helpers/ts-import-hooks.mjs", import.meta.url));
 const { buildTranscriptEntries } = await import("../src/lib/assistant-turns.ts");
 const {
+  isInterimNarration,
   isTurnComplete,
   projectTurnProcess,
   visibleProcessSteps,
@@ -178,6 +179,104 @@ test("only a turn that left flight with a recorded success counts as complete", 
       isRunning: false,
       answer: message("final", "assistant", "", { status: "complete" }),
     }),
+    false,
+  );
+});
+
+/*
+ * Interim narration is presentation, not projection: the trailing candidate is
+ * still the answer candidate either way, but while the turn is running and
+ * earlier work exists it reads as work in progress rather than as the answer.
+ */
+test("only a running turn's streaming candidate over earlier work is interim narration", () => {
+  const live = (extra = {}) =>
+    message("live", "assistant", "Reading the log", {
+      status: "streaming",
+      ...extra,
+    });
+  const interim = (messages, options = {}) => {
+    const projected = projectTurnProcess(turn(messages));
+    return isInterimNarration({
+      isRunning: options.isRunning ?? true,
+      answer: projected.responses.at(-1)?.message,
+      processParts: projected.process,
+      mode: options.mode ?? "detailed",
+      isActive: options.isActive ?? true,
+    });
+  };
+  const prompt = message("user", "user", "Inspect");
+  const read = message("read", "tool", "result", { toolName: "Read" });
+  assert.equal(interim([prompt, read, live()]), true);
+  // The turn-level running state decides: a reader inside the reading window
+  // does not strip the presentation from a turn that is still working.
+  assert.equal(interim([prompt, read, live()], { isActive: false }), true);
+  // Compact hides the reasoning it keeps, not the work the narration follows:
+  // the same gate that decides whether the process group renders at all.
+  assert.equal(
+    interim([prompt, read, live()], { mode: "compact", isActive: false }),
+    true,
+  );
+  // Once the turn is out of flight, the same text is the answer.
+  assert.equal(interim([prompt, read, live()], { isRunning: false }), false);
+  // Reasoning alone is the ordinary path, not work between narration and answer.
+  assert.equal(
+    interim([
+      prompt,
+      message("think", "assistant", "", { thinking: "Weighing options" }),
+      live(),
+    ]),
+    false,
+  );
+  // A hosted-search round is work of the same kind as a tool call.
+  assert.equal(
+    interim([
+      prompt,
+      message("search", "assistant", "", {
+        hostedSearch: {
+          status: "completed",
+          rounds: [
+            { id: "round-1", status: "completed", query: "pi", sources: [] },
+          ],
+        },
+      }),
+      live(),
+    ]),
+    true,
+  );
+  // A settled, aborted, failed or still-empty candidate is not narration.
+  assert.equal(
+    interim([
+      prompt,
+      read,
+      message("live", "assistant", "Done", { status: "complete" }),
+    ]),
+    false,
+  );
+  assert.equal(
+    interim([
+      prompt,
+      read,
+      message("live", "assistant", "Half", { status: "aborted" }),
+    ]),
+    false,
+  );
+  assert.equal(
+    interim([
+      prompt,
+      read,
+      message("live", "assistant", "Half", {
+        status: "streaming",
+        error: { code: "INTERNAL", message: "failed" },
+      }),
+    ]),
+    false,
+  );
+  assert.equal(
+    interim([
+      prompt,
+      read,
+      message("live", "assistant", "   ", { status: "streaming" }),
+    ]),
     false,
   );
 });

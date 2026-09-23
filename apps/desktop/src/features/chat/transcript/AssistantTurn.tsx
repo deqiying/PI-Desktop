@@ -27,6 +27,7 @@ import {
   collectDelegationTimings,
 } from "../../../lib/subagent-topology";
 import {
+  isInterimNarration,
   isLastActivityPart,
   isTurnComplete,
   projectTurnProcess,
@@ -333,17 +334,32 @@ export const AssistantTurn = memo(function AssistantTurn({
   );
   statusesRef.current = turnDelegationStatuses;
   timingsRef.current = turnDelegationTimings;
-  const groupProcess = useAppStore((state) =>
-    shouldGroupTurnProcess(
-      resolveThinkingDisplayMode(state.settings?.thinkingDisplayMode),
-    ),
+  const thinkingMode = useAppStore((state) =>
+    resolveThinkingDisplayMode(state.settings?.thinkingDisplayMode),
   );
+  const groupProcess = shouldGroupTurnProcess(thinkingMode);
   const { process, responses } = projectTurnProcess(entry);
   const activePart = isActive ? entry.parts.at(-1) : undefined;
+  const answerMessage = responses.at(-1)?.message;
   const turnComplete = isTurnComplete({
     isRunning: turnRunning,
-    answer: responses.at(-1)?.message,
+    answer: answerMessage,
   });
+  /*
+    Interim narration: the trailing answer streams at the process indentation
+    and tone while earlier work is still what the turn has produced. It stays
+    outside the collapsible body, so folding the process never hides text that
+    is still streaming.
+  */
+  const interimAnswerId = isInterimNarration({
+    isRunning: turnRunning,
+    answer: answerMessage,
+    processParts: process,
+    mode: thinkingMode,
+    isActive,
+  })
+    ? answerMessage?.id
+    : undefined;
 
   const renderPart = (part: AssistantTurnPart) =>
     part.kind === "activity" ? (
@@ -361,10 +377,8 @@ export const AssistantTurn = memo(function AssistantTurn({
     ) : (
       <div
         className={`message-bubble assistant-turn-fragment${
-          isActive && part.message.status === "streaming"
-            ? " streaming"
-            : ""
-        }`}
+          part.message.id === interimAnswerId ? " interim" : ""
+        }${isActive && part.message.status === "streaming" ? " streaming" : ""}`}
         data-message-id={part.message.id}
         key={part.message.id}
       >

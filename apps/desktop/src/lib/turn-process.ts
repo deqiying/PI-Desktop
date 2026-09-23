@@ -110,6 +110,47 @@ export function shouldAutoOpenTurnProcess(
 }
 
 /**
+ * Interim narration: a trailing answer that is still streaming while the turn
+ * already shows earlier tool or search work reads as work in progress rather
+ * than as the answer.
+ *
+ * The turn's running state decides, not `isActive`: a reader inside the reading
+ * window must not strip presentation from a turn that is still working. A
+ * reasoning step alone does not qualify — reasoning followed by an answer is the
+ * ordinary path — and neither does a candidate that carries an error, which is
+ * an outcome rather than interim text.
+ */
+export function isInterimNarration({
+  isRunning,
+  answer,
+  processParts,
+  mode,
+  isActive,
+}: {
+  /** Turn-level running state, without the reading-window subtraction. */
+  isRunning: boolean;
+  /** The trailing non-empty response candidate, absent when the turn has none. */
+  answer?: UiMessage;
+  processParts: readonly AssistantTurnPart[];
+  mode: ThinkingDisplayMode;
+  isActive: boolean;
+}): boolean {
+  if (!isRunning || !answer || answer.error) return false;
+  // An abort never streams, so requiring `streaming` rules it out as well.
+  if (answer.status !== "streaming" || !answer.content.trim()) return false;
+  const worked = processParts.some(
+    (part) =>
+      part.kind === "activity" &&
+      part.items.some(
+        (item) => item.kind === "tool" || item.kind === "hostedSearch",
+      ),
+  );
+  // The same gate that decides whether the process group renders at all: the
+  // narration must not claim an indentation that is not on screen.
+  return worked && visibleProcessSteps(processParts, mode, isActive) > 0;
+}
+
+/**
  * Only a trailing assistant text can be the answer: text followed by tools is
  * progress. The stream carries no final-answer marker, so a live trailing text
  * remains visible until a later activity establishes that it was intermediate.
