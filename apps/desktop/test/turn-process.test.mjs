@@ -4,6 +4,7 @@ import test from "node:test";
 register(new URL("./helpers/ts-import-hooks.mjs", import.meta.url));
 const { buildTranscriptEntries } = await import("../src/lib/assistant-turns.ts");
 const {
+  isTurnComplete,
   projectTurnProcess,
   visibleProcessSteps,
   resolveThinkingDisplayMode,
@@ -99,16 +100,86 @@ test("missing and unknown display settings retain detailed mode", () => {
   assert.equal(resolveThinkingDisplayMode("compact"), "compact");
 });
 
-test("both display modes group a turn and only compact auto-opens active failures", () => {
+test("a completed turn folds, and only compact auto-opens active failures", () => {
   assert.equal(shouldGroupTurnProcess("detailed"), true);
   assert.equal(shouldGroupTurnProcess("compact"), true);
-  assert.equal(shouldAutoOpenTurnProcess("detailed", false, false), true);
-  assert.equal(shouldAutoOpenTurnProcess("detailed", true, false), true);
-  assert.equal(shouldAutoOpenTurnProcess("detailed", true, true), true);
-  assert.equal(shouldAutoOpenTurnProcess("compact", false, false), false);
-  assert.equal(shouldAutoOpenTurnProcess("compact", true, false), false);
-  assert.equal(shouldAutoOpenTurnProcess("compact", true, true), true);
-  assert.equal(shouldAutoOpenTurnProcess("compact", false, true), false);
+  const detailed = (turnComplete) =>
+    shouldAutoOpenTurnProcess("detailed", {
+      isActive: false,
+      hasToolFailure: false,
+      turnComplete,
+    });
+  assert.equal(detailed(false), true);
+  assert.equal(detailed(true), false);
+  // A failure keeps the fallback too, so the issue count stays reachable.
+  assert.equal(
+    shouldAutoOpenTurnProcess("detailed", {
+      isActive: false,
+      hasToolFailure: true,
+      turnComplete: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAutoOpenTurnProcess("compact", {
+      isActive: false,
+      hasToolFailure: false,
+      turnComplete: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAutoOpenTurnProcess("compact", {
+      isActive: true,
+      hasToolFailure: false,
+      turnComplete: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAutoOpenTurnProcess("compact", {
+      isActive: true,
+      hasToolFailure: true,
+      turnComplete: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAutoOpenTurnProcess("compact", {
+      isActive: false,
+      hasToolFailure: true,
+      turnComplete: true,
+    }),
+    false,
+  );
+});
+
+test("only a turn that left flight with a recorded success counts as complete", () => {
+  const answer = (extra) => message("final", "assistant", "Done", extra);
+  assert.equal(isTurnComplete({ isRunning: false, answer: answer({ status: "complete" }) }), true);
+  // A running turn never folds, however complete its last message looks: the
+  // runtime records `complete` for a message that stopped on a tool call too.
+  assert.equal(isTurnComplete({ isRunning: true, answer: answer({ status: "complete" }) }), false);
+  assert.equal(isTurnComplete({ isRunning: false, answer: answer({}) }), false);
+  assert.equal(isTurnComplete({ isRunning: false, answer: undefined }), false);
+  assert.equal(
+    isTurnComplete({ isRunning: false, answer: answer({ status: "aborted" }) }),
+    false,
+  );
+  assert.equal(
+    isTurnComplete({
+      isRunning: false,
+      answer: answer({ status: "error", error: { code: "INTERNAL", message: "failed" } }),
+    }),
+    false,
+  );
+  assert.equal(
+    isTurnComplete({
+      isRunning: false,
+      answer: message("final", "assistant", "", { status: "complete" }),
+    }),
+    false,
+  );
 });
 
 test("the last activity part owns detailed-mode's default-open tool", () => {

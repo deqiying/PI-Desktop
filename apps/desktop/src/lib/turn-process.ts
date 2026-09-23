@@ -66,13 +66,47 @@ export function isLastActivityPart(
   return false;
 }
 
-/** Detailed keeps narration visible; compact reveals active failures only. */
+/**
+ * A turn is finished only when it left flight and its trailing answer is a
+ * recorded success.
+ *
+ * Message status alone cannot prove that: the runtime records `complete` for
+ * any message whose stop reason is not an error or an abort — `toolUse`
+ * included — and every appended assistant message emits `message_end`. Folding
+ * on status alone would hide a turn's progress while it is still working.
+ *
+ * `isRunning` is the turn-level running state, not the transcript's tail-active
+ * flag: the latter is also false while a reader is inside the reading window.
+ */
+export function isTurnComplete({
+  isRunning,
+  answer,
+}: {
+  isRunning: boolean;
+  answer?: UiMessage;
+}): boolean {
+  if (isRunning || !answer) return false;
+  if (
+    answer.error ||
+    answer.status === "error" ||
+    answer.status === "aborted"
+  ) {
+    return false;
+  }
+  return Boolean(answer.content.trim()) && answer.status === "complete";
+}
+
+/**
+ * Detailed keeps narration visible until the turn is finished for good;
+ * compact reveals active failures only.
+ */
 export function shouldAutoOpenTurnProcess(
   mode: ThinkingDisplayMode,
-  isActive: boolean,
-  hasToolFailure: boolean,
+  state: { isActive: boolean; hasToolFailure: boolean; turnComplete: boolean },
 ): boolean {
-  return mode === "detailed" || (isActive && hasToolFailure);
+  return mode === "compact"
+    ? state.isActive && state.hasToolFailure
+    : !state.turnComplete;
 }
 
 /**

@@ -28,12 +28,15 @@ export function TurnProcess({
   turnParts,
   delegationStatuses,
   isActive,
+  turnComplete,
   children,
 }: {
   turnId: string;
   processParts: readonly AssistantTurnPart[];
   turnParts: readonly AssistantTurnPart[];
   isActive: boolean;
+  /** Turns out of flight with a confirmed answer fold while untouched. */
+  turnComplete: boolean;
   delegationStatuses?: ReadonlyMap<string, SubagentOutcome>;
   children: ReactNode;
 }) {
@@ -55,7 +58,11 @@ export function TurnProcess({
   const breakdown = useActivityBreakdown(summary);
   const thinkingNow = isTurnThinking(turnParts, isActive);
   const disclosure = useAutomaticDisclosure(
-    shouldAutoOpenTurnProcess(mode, isActive, summary.issues > 0),
+    shouldAutoOpenTurnProcess(mode, {
+      isActive,
+      hasToolFailure: summary.issues > 0,
+      turnComplete,
+    }),
     revealRequest,
     disclosureKey("turn", turnId),
   );

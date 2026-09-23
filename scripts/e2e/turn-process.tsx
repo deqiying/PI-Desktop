@@ -60,6 +60,7 @@ export async function turnProcessProbe() {
     active = false,
     search: TranscriptSearchTarget | null = null,
     key = "turn",
+    turnRunning = false,
   ) => {
     const entry = buildTranscriptEntries(messages).entries.find(
       (item) => item.kind === "assistant-turn",
@@ -69,7 +70,12 @@ export async function turnProcessProbe() {
       root.render(
         <I18nextProvider i18n={i18n}>
           <TranscriptSearchContext.Provider value={search}>
-            <AssistantTurn key={key} entry={entry} isActive={active} />
+            <AssistantTurn
+              key={key}
+              entry={entry}
+              isActive={active}
+              turnRunning={turnRunning}
+            />
           </TranscriptSearchContext.Provider>
         </I18nextProvider>,
       ),
@@ -115,12 +121,29 @@ export async function turnProcessProbe() {
       "detailed wraps one process per turn",
     );
     check(
-      header()?.getAttribute("aria-expanded") === "true" && visible(process()),
-      "detailed starts the process open",
+      header()?.getAttribute("aria-expanded") === "false" && !visible(process()),
+      "a completed turn folds its process",
     );
     check(
       visible(container.querySelector('[data-message-id="answer"]')),
       "final answer stays visible",
+    );
+    // A running turn never folds, even though its last message already reads
+    // `complete`: the runtime records that for a message that stopped on a tool.
+    render(messages, true, null, "running", true);
+    check(
+      header()?.getAttribute("aria-expanded") === "true" && visible(process()),
+      "a running turn keeps its process open",
+    );
+    render(messages);
+    check(
+      header()?.getAttribute("aria-expanded") === "false" && !visible(process()),
+      "the fold returns once the turn is out of flight",
+    );
+    click(header());
+    check(
+      header()?.getAttribute("aria-expanded") === "true" && visible(process()),
+      "opening the folded process reveals it",
     );
     check(
       visible(container.querySelector('[data-message-id="progress"]')),
@@ -137,6 +160,29 @@ export async function turnProcessProbe() {
     check(
       container.querySelectorAll(".tool-row").length === 3,
       "detailed shows thinking and both tools in place",
+    );
+    // The untouched fold must not override a reader who opened it by hand.
+    render(messages, true, null, "turn", true);
+    render(messages);
+    check(
+      header()?.getAttribute("aria-expanded") === "true",
+      "a manual open survives the completion fold",
+    );
+    render(messages, false, null, "reveal-folded");
+    check(
+      header()?.getAttribute("aria-expanded") === "false",
+      "the next turn's process starts folded",
+    );
+    render(
+      messages,
+      false,
+      { sessionId: "s", messageId: "progress", query: "problem", requestId: 2 },
+      "reveal-folded",
+    );
+    check(
+      header()?.getAttribute("aria-expanded") === "true" &&
+        visible(container.querySelector('[data-message-id="progress"]')),
+      "a search reveal opens the folded process",
     );
     render(
       [intro, { ...read, toolStatus: "error", isError: true }, answer],

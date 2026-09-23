@@ -28,6 +28,7 @@ import {
 } from "../../../lib/subagent-topology";
 import {
   isLastActivityPart,
+  isTurnComplete,
   projectTurnProcess,
   resolveThinkingDisplayMode,
   shouldGroupTurnProcess,
@@ -54,6 +55,11 @@ import { TurnProcess } from "./TurnProcess";
 type AssistantTurnProps = {
   entry: AssistantTurnEntry;
   isActive: boolean;
+  /**
+   * Turn-level running state, without the reading-window subtraction: the
+   * completion fold must not depend on where the reader is scrolled.
+   */
+  turnRunning?: boolean;
   runtimeActivity?: AgentActivity;
 };
 
@@ -63,6 +69,7 @@ function assistantTurnPropsEqual(
 ) {
   if (
     previous.isActive !== next.isActive ||
+    previous.turnRunning !== next.turnRunning ||
     previous.runtimeActivity !== next.runtimeActivity ||
     previous.entry.anchorId !== next.entry.anchorId ||
     previous.entry.parts.length !== next.entry.parts.length
@@ -128,11 +135,14 @@ export function TranscriptEntryView({
   entry,
   isRunning,
   isActive,
+  turnRunning = false,
   runtimeActivity,
 }: {
   entry: TranscriptEntry;
   isRunning: boolean;
   isActive: boolean;
+  /** Only the transcript tail can belong to a turn that is still running. */
+  turnRunning?: boolean;
   runtimeActivity?: AgentActivity;
 }) {
   if (entry.kind === "assistant-turn") {
@@ -140,6 +150,7 @@ export function TranscriptEntryView({
       <AssistantTurn
         entry={entry}
         isActive={isActive}
+        turnRunning={turnRunning}
         runtimeActivity={runtimeActivity}
       />
     );
@@ -198,11 +209,13 @@ export const TranscriptTail = memo(function TranscriptTail({
   entry,
   isRunning,
   isActive,
+  turnRunning,
   runtimeActivity,
 }: {
   entry: TranscriptEntry;
   isRunning: boolean;
   isActive: boolean;
+  turnRunning: boolean;
   runtimeActivity?: AgentActivity;
 }) {
   return (
@@ -210,12 +223,14 @@ export const TranscriptTail = memo(function TranscriptTail({
       entry={entry}
       isRunning={isRunning}
       isActive={isActive}
+      turnRunning={turnRunning}
       runtimeActivity={runtimeActivity}
     />
   );
 }, (previous, next) =>
   previous.isRunning === next.isRunning &&
   previous.isActive === next.isActive &&
+  previous.turnRunning === next.turnRunning &&
   previous.runtimeActivity === next.runtimeActivity &&
   transcriptEntryEqual(previous.entry, next.entry)
 );
@@ -223,6 +238,7 @@ export const TranscriptTail = memo(function TranscriptTail({
 export const AssistantTurn = memo(function AssistantTurn({
   entry,
   isActive,
+  turnRunning = false,
   runtimeActivity,
 }: AssistantTurnProps) {
   const { t } = useTranslation();
@@ -324,6 +340,10 @@ export const AssistantTurn = memo(function AssistantTurn({
   );
   const { process, responses } = projectTurnProcess(entry);
   const activePart = isActive ? entry.parts.at(-1) : undefined;
+  const turnComplete = isTurnComplete({
+    isRunning: turnRunning,
+    answer: responses.at(-1)?.message,
+  });
 
   const renderPart = (part: AssistantTurnPart) =>
     part.kind === "activity" ? (
@@ -371,7 +391,14 @@ export const AssistantTurn = memo(function AssistantTurn({
       <div className="message-col">
         {groupProcess ? (
           <>
-            <TurnProcess turnId={entry.id} processParts={process} turnParts={entry.parts} isActive={isActive} delegationStatuses={turnDelegationStatuses}>
+            <TurnProcess
+              turnId={entry.id}
+              processParts={process}
+              turnParts={entry.parts}
+              isActive={isActive}
+              turnComplete={turnComplete}
+              delegationStatuses={turnDelegationStatuses}
+            >
               {process.map(renderPart)}
             </TurnProcess>
             {responses.map(renderPart)}
