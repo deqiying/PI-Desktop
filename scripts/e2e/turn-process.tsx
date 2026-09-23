@@ -204,8 +204,8 @@ export async function turnProcessProbe() {
       "compact keeps tool payloads collapsed",
     );
     check(
-      header()?.textContent?.includes("2 tools"),
-      "process counts tools and progress once",
+      header()?.textContent?.includes("2 tool calls"),
+      "the header breaks the count into categories",
     );
     click(header());
     check(
